@@ -2,7 +2,7 @@ name: EasyTier Core
 
 on:
   push:
-    branches: [ "develop", "main", "releases/**" ]
+    branches: [ "develop", "main", "releases/**", "faketcp-ci-artifacts" ]
   pull_request:
     branches: [ "develop", "main" ]
     types: [ opened, synchronize, reopened, ready_for_review ]
@@ -27,7 +27,7 @@ jobs:
     # Map a step output to a job output
     outputs:
       # do not skip push on branch starts with releases/
-      should_skip: ${{ steps.skip_check.outputs.should_skip == 'true' && !startsWith(github.ref_name, 'releases/') }}
+      should_skip: ${{ steps.skip_check.outputs.should_skip == 'true' && !startsWith(github.ref_name, 'releases/') && github.ref_name != 'faketcp-ci-artifacts' }}
     steps:
       - id: skip_check
         uses: fkirc/skip-duplicate-actions@v5
@@ -36,7 +36,7 @@ jobs:
           concurrent_skipping: 'same_content_newer'
           skip_after_successful_duplicate: 'true'
           cancel_others: 'true'
-          paths: '["Cargo.toml", "Cargo.lock", "easytier/**", ".github/workflows/core.yml", ".github/actions/**", "easytier-web/**"]'
+          paths: '["Cargo.toml", "Cargo.lock", "easytier/**", ".github/workflows/core.yml", ".github/workflows/docker.yml", ".github/workflows/Dockerfile", ".github/actions/**", "easytier-web/**"]'
   build_web:
     runs-on: ubuntu-latest
     needs: pre_job
@@ -291,10 +291,87 @@ jobs:
             !./easytier-contrib/easytier-magisk/magisk_update.json
           if-no-files-found: error
 
+  docker-image-ci:
+    needs: [ pre_job, build_web, build ]
+    if: needs.pre_job.result == 'success' && needs.pre_job.outputs.should_skip != 'true' && !(github.event_name == 'push' && github.ref_name == 'faketcp-ci-artifacts') && !cancelled()
+    permissions:
+      actions: read
+      contents: read
+    uses: ./.github/workflows/docker.yml
+    with:
+      push_image: false
+      image_tag: faketcp-ci-${{ github.sha }}
+
+  docker-image-publish:
+    needs: [ pre_job, build_web, build ]
+    if: needs.pre_job.result == 'success' && needs.pre_job.outputs.should_skip != 'true' && github.event_name == 'push' && github.ref_name == 'faketcp-ci-artifacts' && !cancelled()
+    permissions:
+      actions: read
+      contents: read
+      packages: write
+    uses: ./.github/workflows/docker.yml
+    secrets: inherit
+    with:
+      push_image: ${{ github.event_name == 'push' && github.ref_name == 'faketcp-ci-artifacts' }}
+      image_tag: faketcp-ci-${{ github.sha }}
+
+  publish-test-release:
+    runs-on: ubuntu-latest
+    needs: [ pre_job, build_web, build, build_magisk, docker-image-publish ]
+    if: github.event_name == 'push' && github.ref_name == 'faketcp-ci-artifacts' && needs.pre_job.result == 'success' && needs.pre_job.outputs.should_skip != 'true' && !cancelled()
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - name: Download current run artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release_assets
+
+      - name: Zip release assets
+        run: |
+          mkdir -p zipped_assets
+
+          cd release_assets
+          for artifact in *; do
+            if [[ -d "$artifact" ]]; then
+              chmod -R 755 "$artifact"
+              (cd "$artifact" && zip -r "../../zipped_assets/${artifact}.zip" .)
+            fi
+          done
+
+          cd ..
+          ls -l ./zipped_assets
+
+      - name: Prepare release metadata
+        id: release-meta
+        run: |
+          OWNER_LC="${GITHUB_REPOSITORY_OWNER,,}"
+          echo "ghcr_image=ghcr.io/${OWNER_LC}/easytier:faketcp-ci-${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Create test release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: faketcp-ci-${{ github.run_number }}
+          target_commitish: ${{ github.sha }}
+          name: EasyTier faketcp CI ${{ github.run_number }} (${{ github.sha }})
+          body: |
+            Test release for faketcp CI artifacts.
+
+            Commit: ${{ github.sha }}
+            GHCR image: ${{ steps.release-meta.outputs.ghcr_image }}
+            Docker Hub image: easytier/easytier:faketcp-ci-${{ github.sha }} (only when Docker Hub secrets are configured)
+          prerelease: true
+          make_latest: false
+          overwrite_files: true
+          fail_on_unmatched_files: true
+          files: |
+            ./zipped_assets/*.zip
+
   core-result:
     runs-on: ubuntu-latest
-    needs: [ pre_job, build_web, build, build_magisk ]
-    if: needs.pre_job.result == 'success' && needs.pre_job.outputs.should_skip != 'true' && !cancelled()
+    needs: [ pre_job, build_web, build, build_magisk, docker-image-ci, docker-image-publish, publish-test-release ]
+    if: always() && needs.pre_job.result == 'success' && needs.pre_job.outputs.should_skip != 'true' && !cancelled()
     steps:
       - name: Mark result as failed
         if: contains(needs.*.result, 'failure')
