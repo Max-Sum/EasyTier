@@ -36,11 +36,6 @@ on:
         default: false
         required: true
 
-permissions:
-  actions: read
-  contents: read
-  packages: write
-
 jobs:
   docker:
     if: github.event_name != 'workflow_dispatch' || contains('["KKRainbow"]', github.actor)
