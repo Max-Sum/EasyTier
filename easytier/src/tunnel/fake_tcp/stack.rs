@@ -278,8 +278,7 @@ impl Socket {
                         continue;
                     }
 
-                    let new_rcv_nxt =
-                        tcp_packet.get_sequence().wrapping_add(payload.len() as u32);
+                    let new_rcv_nxt = tcp_packet.get_sequence().wrapping_add(payload.len() as u32);
                     self.rcv_nxt.store(new_rcv_nxt, Ordering::Relaxed);
 
                     buf.extend_from_slice(payload);
@@ -527,7 +526,6 @@ impl Stack {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pnet::packet::Packet as _;
     use pnet::packet::ipv4;
     use std::sync::atomic::Ordering;
     use std::sync::{Arc, Barrier, Mutex};
@@ -627,10 +625,8 @@ mod tests {
         packet.extend_from_slice(&options);
         packet.extend_from_slice(&base[payload_start..]);
 
-        let total_len =
-            (IPV4_HEADER_LEN + TCP_HEADER_LEN + options.len() + payload.len()) as u16;
-        packet[ETH_HEADER_LEN + 2..ETH_HEADER_LEN + 4]
-            .copy_from_slice(&total_len.to_be_bytes());
+        let total_len = (IPV4_HEADER_LEN + TCP_HEADER_LEN + options.len() + payload.len()) as u16;
+        packet[ETH_HEADER_LEN + 2..ETH_HEADER_LEN + 4].copy_from_slice(&total_len.to_be_bytes());
         let tcp_header_words = ((TCP_HEADER_LEN + options.len()) / 4) as u8;
         packet[tcp_start + 12] = tcp_header_words << 4;
 
