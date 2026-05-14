@@ -59,9 +59,6 @@ use tracing::{info, trace, warn};
 const TIMEOUT: time::Duration = time::Duration::from_secs(1);
 const RETRIES: usize = 6;
 const MPMC_BUFFER_LEN: usize = 512;
-const MAX_UNACKED_LEN: u32 = 128 * 1024 * 1024; // 128MB
-const MAX_ZERO_FILL_LEN: u32 = 1400;
-
 fn seq_after(seq: u32, other: u32) -> bool {
     seq != other && seq.wrapping_sub(other) < (1u32 << 31)
 }
@@ -227,51 +224,45 @@ impl Socket {
     }
 
     fn send_sack_zero_fill(&self, tcp_packet: &tcp::TcpPacket<'_>) {
-        let seg_ack = tcp_packet.get_acknowledgement();
-
         for opt in tcp_packet.get_options_iter() {
             if opt.get_number() != TcpOptionNumbers::SACK {
                 continue;
             }
 
             let payload = opt.payload();
-            let Some(first_sack) = payload.chunks(8).next() else {
-                continue;
-            };
-            if first_sack.len() != 8 {
-                continue;
+            for chunk in payload.chunks(8) {
+                if chunk.len() != 8 {
+                    continue;
+                }
+
+                let left = tcp_packet.get_acknowledgement();
+                let right = u32::from_be_bytes(chunk[0..4].try_into().unwrap());
+                let len = right.wrapping_sub(left);
+
+                let sack_end = u32::from_be_bytes(chunk[4..8].try_into().unwrap());
+                if len == 0 || sack_end <= left {
+                    continue;
+                }
+
+                let send_len = std::cmp::min(len, 1400) as usize;
+                let data = vec![0u8; send_len];
+
+                let buf = build_tcp_packet(
+                    self.local_mac,
+                    self.remote_mac.load().unwrap_or(MacAddr::zero()),
+                    self.local_addr,
+                    self.remote_addr,
+                    left,
+                    self.rcv_nxt.load(Ordering::Relaxed),
+                    tcp::TcpFlags::ACK,
+                    Some(&data),
+                );
+
+                if let Err(e) = self.tun.try_send(&buf) {
+                    tracing::error!("Failed to send SACK zero filler: {}", e);
+                }
+                break;
             }
-
-            let first_sack_left = u32::from_be_bytes(first_sack[0..4].try_into().unwrap());
-            let first_sack_right = u32::from_be_bytes(first_sack[4..8].try_into().unwrap());
-            if !seq_after(first_sack_left, seg_ack) || !seq_after(first_sack_right, first_sack_left)
-            {
-                continue;
-            }
-
-            let gap_len = first_sack_left.wrapping_sub(seg_ack);
-            if gap_len == 0 || gap_len > MAX_UNACKED_LEN {
-                continue;
-            }
-
-            let send_len = std::cmp::min(gap_len, MAX_ZERO_FILL_LEN) as usize;
-            let data = vec![0u8; send_len];
-            let buf = build_tcp_packet(
-                self.local_mac,
-                self.remote_mac.load().unwrap_or(MacAddr::zero()),
-                self.local_addr,
-                self.remote_addr,
-                seg_ack,
-                self.rcv_nxt.load(Ordering::Relaxed),
-                tcp::TcpFlags::ACK,
-                Some(&data),
-            );
-
-            if let Err(e) = self.tun.try_send(&buf) {
-                tracing::error!("Failed to send SACK zero filler: {}", e);
-            }
-
-            break;
         }
     }
 
