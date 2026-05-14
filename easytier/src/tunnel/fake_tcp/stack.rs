@@ -268,12 +268,14 @@ impl Socket {
 
                     let payload = tcp_packet.payload();
                     let is_zero_filler = !payload.is_empty() && payload.iter().all(|&b| b == 0);
+                    let is_peer_kernel_ack =
+                        (tcp_packet.get_flags() & tcp::TcpFlags::ACK) != 0 && payload.is_empty();
 
                     if !is_zero_filler {
                         self.sync_header_ack_from_peer(&tcp_packet);
                     }
 
-                    if (tcp_packet.get_flags() & tcp::TcpFlags::ACK) != 0 && payload.is_empty() {
+                    if is_peer_kernel_ack {
                         self.seq
                             .store(tcp_packet.get_acknowledgement(), Ordering::Relaxed);
                     }
@@ -766,6 +768,35 @@ mod tests {
         poll_recv_until_pending(&socket).await;
 
         assert_eq!(socket.seq.load(Ordering::Relaxed), 4000);
+    }
+
+    #[tokio::test]
+    async fn fake_payload_ack_does_not_rewind_seq() {
+        let (socket, incoming, _tun) = socket_with_state(Some(777), State::Established);
+
+        incoming
+            .send(inbound_packet(
+                &socket,
+                1001,
+                5000,
+                tcp::TcpFlags::ACK,
+                None,
+            ))
+            .unwrap();
+        incoming
+            .send(inbound_packet(
+                &socket,
+                1001,
+                1,
+                tcp::TcpFlags::ACK,
+                Some(b"data"),
+            ))
+            .unwrap();
+
+        let mut buf = BytesMut::new();
+        assert_eq!(socket.recv(&mut buf).await, Some(4));
+        assert_eq!(&buf[..], b"data");
+        assert_eq!(socket.seq.load(Ordering::Relaxed), 5000);
     }
 
     #[tokio::test]
