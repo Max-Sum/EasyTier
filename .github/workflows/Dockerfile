@@ -42,4 +42,5 @@ EXPOSE 11011/tcp
 # wss
 EXPOSE 11012/tcp
 
-ENTRYPOINT ["/sbin/tini", "--", "easytier-core"]
+ENTRYPOINT ["/sbin/tini", "--"]
+CMD ["easytier-core"]
