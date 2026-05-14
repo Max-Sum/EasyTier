@@ -41,6 +41,7 @@
 use super::packet::*;
 use bytes::{Bytes, BytesMut};
 use crossbeam::atomic::AtomicCell;
+use pnet::packet::tcp::TcpOptionNumbers;
 use pnet::packet::{Packet, tcp};
 use pnet::util::MacAddr;
 use std::collections::{HashMap, HashSet};
@@ -48,7 +49,7 @@ use std::fmt;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{
     Arc, RwLock,
-    atomic::{AtomicU32, Ordering},
+    atomic::{AtomicBool, AtomicU32, Ordering},
 };
 use tokio::sync::broadcast;
 use tokio::time;
@@ -59,6 +60,7 @@ const TIMEOUT: time::Duration = time::Duration::from_secs(1);
 const RETRIES: usize = 6;
 const MPMC_BUFFER_LEN: usize = 512;
 const MAX_UNACKED_LEN: u32 = 128 * 1024 * 1024; // 128MB
+const MAX_ZERO_FILL_LEN: u32 = 1400;
 
 fn seq_after(seq: u32, other: u32) -> bool {
     seq != other && seq.wrapping_sub(other) < (1u32 << 31)
@@ -119,6 +121,7 @@ pub struct Socket {
     remote_mac: AtomicCell<Option<MacAddr>>,
     snd_nxt: AtomicU32,
     snd_una: AtomicU32,
+    snd_initialized: AtomicBool,
     rcv_nxt: AtomicU32,
     state: AtomicCell<State>,
 }
@@ -155,6 +158,7 @@ impl Socket {
                 remote_mac: AtomicCell::new(remote_mac),
                 snd_nxt: AtomicU32::new(0),
                 snd_una: AtomicU32::new(0),
+                snd_initialized: AtomicBool::new(false),
                 rcv_nxt: AtomicU32::new(ack.unwrap_or(0)),
                 state: AtomicCell::new(state),
             },
@@ -175,6 +179,19 @@ impl Socket {
         )
     }
 
+    fn handle_ack(&self, ack: u32) {
+        if self
+            .snd_initialized
+            .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            self.snd_nxt.store(ack, Ordering::Relaxed);
+            self.snd_una.store(ack, Ordering::Relaxed);
+        } else {
+            self.update_snd_una(ack);
+        }
+    }
+
     fn update_snd_una(&self, ack: u32) {
         let snd_nxt = self.snd_nxt.load(Ordering::Relaxed);
         let mut current = self.snd_una.load(Ordering::Relaxed);
@@ -189,6 +206,72 @@ impl Socket {
                 Ok(_) => return,
                 Err(next) => current = next,
             }
+        }
+    }
+
+    fn update_rcv_nxt(&self, seq: u32, payload_len: usize) {
+        let new_rcv_nxt = seq.wrapping_add(payload_len as u32);
+        let mut current = self.rcv_nxt.load(Ordering::Relaxed);
+
+        while seq_after(new_rcv_nxt, current) {
+            match self.rcv_nxt.compare_exchange_weak(
+                current,
+                new_rcv_nxt,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(next) => current = next,
+            }
+        }
+    }
+
+    fn send_sack_zero_fill(&self, tcp_packet: &tcp::TcpPacket<'_>) {
+        let seg_ack = tcp_packet.get_acknowledgement();
+
+        for opt in tcp_packet.get_options_iter() {
+            if opt.get_number() != TcpOptionNumbers::SACK {
+                continue;
+            }
+
+            let payload = opt.payload();
+            let Some(first_sack) = payload.chunks(8).next() else {
+                continue;
+            };
+            if first_sack.len() != 8 {
+                continue;
+            }
+
+            let first_sack_left = u32::from_be_bytes(first_sack[0..4].try_into().unwrap());
+            let first_sack_right = u32::from_be_bytes(first_sack[4..8].try_into().unwrap());
+            if !seq_after(first_sack_left, seg_ack) || !seq_after(first_sack_right, first_sack_left)
+            {
+                continue;
+            }
+
+            let gap_len = first_sack_left.wrapping_sub(seg_ack);
+            if gap_len == 0 || gap_len > MAX_UNACKED_LEN {
+                continue;
+            }
+
+            let send_len = std::cmp::min(gap_len, MAX_ZERO_FILL_LEN) as usize;
+            let data = vec![0u8; send_len];
+            let buf = build_tcp_packet(
+                self.local_mac,
+                self.remote_mac.load().unwrap_or(MacAddr::zero()),
+                self.local_addr,
+                self.remote_addr,
+                seg_ack,
+                self.rcv_nxt.load(Ordering::Relaxed),
+                tcp::TcpFlags::ACK,
+                Some(&data),
+            );
+
+            if let Err(e) = self.tun.try_send(&buf) {
+                tracing::error!("Failed to send SACK zero filler: {}", e);
+            }
+
+            break;
         }
     }
 
@@ -269,7 +352,8 @@ impl Socket {
                     }
 
                     if (tcp_packet.get_flags() & tcp::TcpFlags::ACK) != 0 {
-                        self.update_snd_una(tcp_packet.get_acknowledgement());
+                        self.handle_ack(tcp_packet.get_acknowledgement());
+                        self.send_sack_zero_fill(&tcp_packet);
                     }
 
                     let payload = tcp_packet.payload();
@@ -278,8 +362,11 @@ impl Socket {
                         continue;
                     }
 
-                    let new_rcv_nxt = tcp_packet.get_sequence().wrapping_add(payload.len() as u32);
-                    self.rcv_nxt.store(new_rcv_nxt, Ordering::Relaxed);
+                    self.update_rcv_nxt(tcp_packet.get_sequence(), payload.len());
+
+                    if payload.iter().all(|&b| b == 0) {
+                        continue;
+                    }
 
                     buf.extend_from_slice(payload);
 
@@ -308,6 +395,7 @@ impl Socket {
                         let ack = tcp_packet.get_acknowledgement();
                         self.snd_nxt.store(ack, Ordering::Relaxed);
                         self.snd_una.store(ack, Ordering::Relaxed);
+                        self.snd_initialized.store(true, Ordering::Relaxed);
                         self.rcv_nxt
                             .store(tcp_packet.get_sequence().wrapping_add(1), Ordering::Relaxed);
                         self.remote_mac.store(Some(src_mac));
@@ -610,7 +698,14 @@ mod tests {
         )
     }
 
-    fn inbound_sack_packet(socket: &Socket, seq: u32, ack: u32, payload: &[u8]) -> Bytes {
+    fn inbound_sack_packet(
+        socket: &Socket,
+        seq: u32,
+        ack: u32,
+        first_sack_left: u32,
+        first_sack_right: u32,
+        payload: &[u8],
+    ) -> Bytes {
         const ETH_HEADER_LEN: usize = 14;
         const IPV4_HEADER_LEN: usize = 20;
         const TCP_HEADER_LEN: usize = 20;
@@ -618,7 +713,13 @@ mod tests {
         let base = inbound_packet(socket, seq, ack, Some(payload));
         let tcp_start = ETH_HEADER_LEN + IPV4_HEADER_LEN;
         let payload_start = tcp_start + TCP_HEADER_LEN;
-        let options = [5, 10, 0, 0, 0, 50, 0, 0, 0, 60, 1, 1];
+        let mut options = [0u8; 12];
+        options[0] = 5;
+        options[1] = 10;
+        options[2..6].copy_from_slice(&first_sack_left.to_be_bytes());
+        options[6..10].copy_from_slice(&first_sack_right.to_be_bytes());
+        options[10] = 1;
+        options[11] = 1;
         let mut packet = Vec::with_capacity(base.len() + options.len());
 
         packet.extend_from_slice(&base[..payload_start]);
@@ -663,23 +764,46 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ack_only_does_not_move_next_send_sequence_back() {
+    async fn first_ack_only_bootstraps_send_sequence() {
         let (_stack, socket, tun) = established_socket().await;
-        socket.snd_nxt.store(1000, Ordering::Relaxed);
-        socket.snd_una.store(900, Ordering::Relaxed);
 
         let incoming = incoming_sender(&socket);
         incoming
-            .send(inbound_packet(&socket, 50, 800, None))
+            .send(inbound_packet(&socket, 50, 5000, None))
             .unwrap();
         incoming
-            .send(inbound_packet(&socket, 60, 800, Some(b"pong")))
+            .send(inbound_packet(&socket, 60, 5000, Some(b"pong")))
             .unwrap();
 
         let mut buf = BytesMut::new();
         assert_eq!(socket.recv(&mut buf).await, Some(4));
         assert_eq!(&buf[..], b"pong");
-        assert_eq!(socket.snd_una.load(Ordering::Relaxed), 900);
+        assert_eq!(socket.snd_nxt.load(Ordering::Relaxed), 5000);
+        assert_eq!(socket.snd_una.load(Ordering::Relaxed), 5000);
+        assert!(socket.snd_initialized.load(Ordering::Relaxed));
+        assert!(tun.sent_packets().is_empty());
+    }
+
+    #[tokio::test]
+    async fn ack_only_after_bootstrap_does_not_move_next_send_sequence_back() {
+        let (_stack, socket, tun) = established_socket().await;
+
+        let incoming = incoming_sender(&socket);
+        incoming
+            .send(inbound_packet(&socket, 50, 1000, None))
+            .unwrap();
+        incoming
+            .send(inbound_packet(&socket, 60, 800, None))
+            .unwrap();
+        incoming
+            .send(inbound_packet(&socket, 70, 800, Some(b"pong")))
+            .unwrap();
+
+        let mut buf = BytesMut::new();
+        assert_eq!(socket.recv(&mut buf).await, Some(4));
+        assert_eq!(&buf[..], b"pong");
+        assert_eq!(socket.snd_nxt.load(Ordering::Relaxed), 1000);
+        assert_eq!(socket.snd_una.load(Ordering::Relaxed), 1000);
 
         socket.try_send(b"next").unwrap();
 
@@ -691,18 +815,45 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sack_option_does_not_trigger_zero_fill_send() {
+    async fn sack_option_triggers_zero_fill_send() {
         let (_stack, socket, tun) = established_socket().await;
         let incoming = incoming_sender(&socket);
 
         incoming
-            .send(inbound_sack_packet(&socket, 100, 0, b"data"))
+            .send(inbound_sack_packet(&socket, 100, 1000, 1120, 1300, b"data"))
             .unwrap();
 
         let mut buf = BytesMut::new();
         assert_eq!(socket.recv(&mut buf).await, Some(4));
         assert_eq!(&buf[..], b"data");
-        assert!(tun.sent_packets().is_empty());
+
+        let sent = tun.sent_packets();
+        assert_eq!(sent.len(), 1);
+        let (_, _, _, tcp_packet) = parse_ip_packet(&sent[0]).unwrap();
+        assert_eq!(tcp_packet.get_sequence(), 1000);
+        assert_eq!(tcp_packet.get_flags(), tcp::TcpFlags::ACK);
+        assert_eq!(tcp_packet.payload().len(), 120);
+        assert!(tcp_packet.payload().iter().all(|&b| b == 0));
+        assert_eq!(socket.snd_nxt.load(Ordering::Relaxed), 1000);
+        assert_eq!(socket.snd_una.load(Ordering::Relaxed), 1000);
+    }
+
+    #[tokio::test]
+    async fn zero_filler_payload_is_dropped_before_upper_layer() {
+        let (_stack, socket, _tun) = established_socket().await;
+        let incoming = incoming_sender(&socket);
+
+        incoming
+            .send(inbound_packet(&socket, 10, 0, Some(&[0, 0, 0, 0])))
+            .unwrap();
+        incoming
+            .send(inbound_packet(&socket, 14, 0, Some(b"real")))
+            .unwrap();
+
+        let mut buf = BytesMut::new();
+        assert_eq!(socket.recv(&mut buf).await, Some(4));
+        assert_eq!(&buf[..], b"real");
+        assert_eq!(socket.rcv_nxt.load(Ordering::Relaxed), 18);
     }
 
     #[tokio::test]
