@@ -61,21 +61,6 @@ const RETRIES: usize = 6;
 const MPMC_BUFFER_LEN: usize = 512;
 const MAX_UNACKED_LEN: u32 = 128 * 1024 * 1024; // 128MB
 
-fn seq_after(a: u32, b: u32) -> bool {
-    a != b && a.wrapping_sub(b) < (1u32 << 31)
-}
-
-fn advance_atomic_u32(atom: &AtomicU32, new: u32) {
-    let mut current = atom.load(Ordering::Relaxed);
-
-    while seq_after(new, current) {
-        match atom.compare_exchange_weak(current, new, Ordering::Relaxed, Ordering::Relaxed) {
-            Ok(_) => return,
-            Err(next) => current = next,
-        }
-    }
-}
-
 #[async_trait::async_trait]
 pub trait Tun: Send + Sync + 'static {
     async fn recv(&self, packet: &mut BytesMut) -> Result<usize, std::io::Error>;
@@ -132,7 +117,6 @@ pub struct Socket {
     seq: AtomicU32,
     ack: AtomicU32,
     last_ack: AtomicU32,
-    seq_initialized: AtomicBool,
     ack_initialized: AtomicBool,
     state: AtomicCell<State>,
 }
@@ -170,7 +154,6 @@ impl Socket {
                 seq: AtomicU32::new(0),
                 ack: AtomicU32::new(ack.unwrap_or(0)),
                 last_ack: AtomicU32::new(ack.unwrap_or(0)),
-                seq_initialized: AtomicBool::new(false),
                 ack_initialized: AtomicBool::new(ack.is_some()),
                 state: AtomicCell::new(state),
             },
@@ -178,30 +161,23 @@ impl Socket {
         )
     }
 
-    fn sync_seq_from_peer_ack(&self, peer_ack: u32) {
-        if self
-            .seq_initialized
-            .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
-            .is_ok()
-        {
-            self.seq.store(peer_ack, Ordering::Relaxed);
-        } else {
-            advance_atomic_u32(&self.seq, peer_ack);
-        }
-    }
-
-    fn sync_ack_from_peer_payload(&self, peer_seq: u32, payload_len: usize) {
-        let next_ack = peer_seq.wrapping_add(payload_len as u32);
-
+    fn sync_header_ack_from_peer(&self, tcp_packet: &tcp::TcpPacket<'_>) {
         if self
             .ack_initialized
             .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
-            .is_ok()
+            .is_err()
         {
-            self.ack.store(next_ack, Ordering::Relaxed);
-        } else {
-            advance_atomic_u32(&self.ack, next_ack);
+            return;
         }
+
+        let mut ack = tcp_packet.get_sequence();
+        if (tcp_packet.get_flags() & tcp::TcpFlags::SYN) != 0 {
+            ack = ack.wrapping_add(1);
+        }
+        if (tcp_packet.get_flags() & tcp::TcpFlags::FIN) != 0 {
+            ack = ack.wrapping_add(1);
+        }
+        self.ack.store(ack, Ordering::Relaxed);
     }
 
     fn build_tcp_packet(&self, flags: u8, payload: Option<&[u8]>) -> Bytes {
@@ -290,25 +266,16 @@ impl Socket {
                         return None;
                     }
 
-                    if (tcp_packet.get_flags() & tcp::TcpFlags::ACK) != 0 {
-                        self.sync_seq_from_peer_ack(tcp_packet.get_acknowledgement());
-                    }
-
                     let payload = tcp_packet.payload();
                     let is_zero_filler = !payload.is_empty() && payload.iter().all(|&b| b == 0);
 
-                    if is_zero_filler {
-                        if self.ack_initialized.load(Ordering::Relaxed) {
-                            self.sync_ack_from_peer_payload(
-                                tcp_packet.get_sequence(),
-                                payload.len(),
-                            );
-                        }
-                        continue;
+                    if !is_zero_filler {
+                        self.sync_header_ack_from_peer(&tcp_packet);
                     }
 
-                    if !payload.is_empty() {
-                        self.sync_ack_from_peer_payload(tcp_packet.get_sequence(), payload.len());
+                    if (tcp_packet.get_flags() & tcp::TcpFlags::ACK) != 0 && payload.is_empty() {
+                        self.seq
+                            .store(tcp_packet.get_acknowledgement(), Ordering::Relaxed);
                     }
 
                     for opt in tcp_packet.get_options_iter() {
@@ -344,8 +311,6 @@ impl Socket {
 
                                 if let Err(e) = self.tun.try_send(&buf) {
                                     tracing::error!("Failed to send SACK response: {}", e);
-                                } else {
-                                    self.sync_seq_from_peer_ack(left.wrapping_add(send_len as u32));
                                 }
                                 break;
                             }
@@ -353,6 +318,10 @@ impl Socket {
                     }
 
                     if payload.is_empty() {
+                        continue;
+                    }
+
+                    if is_zero_filler {
                         continue;
                     }
 
@@ -384,7 +353,6 @@ impl Socket {
                             .store(tcp_packet.get_acknowledgement(), Ordering::Relaxed);
                         self.ack
                             .store(tcp_packet.get_sequence().wrapping_add(1), Ordering::Relaxed);
-                        self.seq_initialized.store(true, Ordering::Relaxed);
                         self.ack_initialized.store(true, Ordering::Relaxed);
                         self.remote_mac.store(Some(src_mac));
                         self.state.store(State::Established);
@@ -505,7 +473,7 @@ impl Stack {
             remote_addr,
             self.local_mac,
             None,
-            None, // ACK is unknown until first real peer payload
+            None,
             state,
         );
         assert!(tuples.insert(tuple, incoming).is_none());
@@ -643,7 +611,10 @@ mod tests {
         MacAddr::new(0, 1, 2, 3, 4, id)
     }
 
-    fn established_socket(ack: Option<u32>) -> (Socket, flume::Sender<Bytes>, Arc<MockTun>) {
+    fn socket_with_state(
+        ack: Option<u32>,
+        state: State,
+    ) -> (Socket, flume::Sender<Bytes>, Arc<MockTun>) {
         let tun = Arc::new(MockTun::new());
         let tun_trait: Arc<dyn Tun> = tun.clone();
         let (tuples_purge, _) = broadcast::channel(16);
@@ -663,7 +634,7 @@ mod tests {
             test_mac(1),
             Some(test_mac(2)),
             ack,
-            State::Established,
+            state,
         );
         shared
             .tuples
@@ -674,7 +645,25 @@ mod tests {
         (socket, incoming, tun)
     }
 
-    fn inbound_packet(socket: &Socket, seq: u32, ack: u32, payload: Option<&[u8]>) -> Bytes {
+    fn incoming_sender(socket: &Socket) -> flume::Sender<Bytes> {
+        let tuple = AddrTuple::new(socket.local_addr, socket.remote_addr);
+        socket
+            .shared
+            .tuples
+            .read()
+            .unwrap()
+            .get(&tuple)
+            .unwrap()
+            .clone()
+    }
+
+    fn inbound_packet(
+        socket: &Socket,
+        seq: u32,
+        ack: u32,
+        flags: u8,
+        payload: Option<&[u8]>,
+    ) -> Bytes {
         build_tcp_packet(
             test_mac(2),
             test_mac(1),
@@ -682,7 +671,7 @@ mod tests {
             socket.local_addr,
             seq,
             ack,
-            tcp::TcpFlags::ACK,
+            flags,
             payload,
         )
     }
@@ -699,7 +688,7 @@ mod tests {
         const IPV4_HEADER_LEN: usize = 20;
         const TCP_HEADER_LEN: usize = 20;
 
-        let base = inbound_packet(socket, seq, ack, Some(payload));
+        let base = inbound_packet(socket, seq, ack, tcp::TcpFlags::ACK, Some(payload));
         let tcp_start = ETH_HEADER_LEN + IPV4_HEADER_LEN;
         let payload_start = tcp_start + TCP_HEADER_LEN;
         let mut options = [0u8; 12];
@@ -752,37 +741,83 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn first_ack_initializes_seq() {
-        let (socket, incoming, _tun) = established_socket(None);
+    async fn ack_only_preserves_seq_rewind_behavior() {
+        let (socket, incoming, _tun) = socket_with_state(Some(500), State::Established);
 
         incoming
-            .send(inbound_packet(&socket, 10, 5000, None))
+            .send(inbound_packet(
+                &socket,
+                1001,
+                5000,
+                tcp::TcpFlags::ACK,
+                None,
+            ))
+            .unwrap();
+        incoming
+            .send(inbound_packet(
+                &socket,
+                1001,
+                4000,
+                tcp::TcpFlags::ACK,
+                None,
+            ))
             .unwrap();
 
         poll_recv_until_pending(&socket).await;
 
-        assert!(socket.seq_initialized.load(Ordering::Relaxed));
-        assert_eq!(socket.seq.load(Ordering::Relaxed), 5000);
+        assert_eq!(socket.seq.load(Ordering::Relaxed), 4000);
     }
 
     #[tokio::test]
-    async fn old_ack_does_not_move_seq_back() {
-        let (socket, incoming, _tun) = established_socket(None);
+    async fn fake_payload_does_not_advance_header_ack() {
+        let (socket, incoming, tun) = socket_with_state(Some(777), State::Established);
 
         incoming
-            .send(inbound_packet(&socket, 10, 1000, None))
-            .unwrap();
-        incoming
-            .send(inbound_packet(&socket, 11, 800, None))
+            .send(inbound_packet(
+                &socket,
+                1001,
+                0,
+                tcp::TcpFlags::ACK,
+                Some(b"data"),
+            ))
             .unwrap();
 
-        poll_recv_until_pending(&socket).await;
+        let mut buf = BytesMut::new();
+        assert_eq!(socket.recv(&mut buf).await, Some(4));
+        assert_eq!(&buf[..], b"data");
+        assert_eq!(socket.ack.load(Ordering::Relaxed), 777);
 
-        assert_eq!(socket.seq.load(Ordering::Relaxed), 1000);
+        socket.try_send(b"reply").unwrap();
+        let sent = tun.sent_packets();
+        assert_eq!(sent.len(), 1);
+        let (_, _, _, tcp_packet) = parse_ip_packet(&sent[0]).unwrap();
+        assert_eq!(tcp_packet.get_acknowledgement(), 777);
+        assert_eq!(tcp_packet.payload(), b"reply");
     }
 
     #[tokio::test]
-    async fn server_established_socket_starts_with_uninitialized_ack() {
+    async fn syn_sent_initializes_header_ack_from_syn_ack() {
+        let (socket, incoming, _tun) = socket_with_state(None, State::SynSent);
+
+        incoming
+            .send(inbound_packet(
+                &socket,
+                9000,
+                3001,
+                tcp::TcpFlags::SYN | tcp::TcpFlags::ACK,
+                None,
+            ))
+            .unwrap();
+
+        let mut buf = BytesMut::new();
+        assert_eq!(socket.recv(&mut buf).await, Some(0));
+        assert_eq!(socket.seq.load(Ordering::Relaxed), 3001);
+        assert_eq!(socket.ack.load(Ordering::Relaxed), 9001);
+        assert!(socket.ack_initialized.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn server_established_header_ack_initializes_from_first_peer_packet() {
         let tun = Arc::new(MockTun::new());
         let tun_trait: Arc<dyn Tun> = tun;
         let mut stack = Stack::new(
@@ -798,84 +833,78 @@ mod tests {
                 State::Established,
             )
             .await;
+        let incoming = incoming_sender(&socket);
 
         assert!(!socket.ack_initialized.load(Ordering::Relaxed));
         assert_eq!(socket.ack.load(Ordering::Relaxed), 0);
+
+        incoming
+            .send(inbound_packet(
+                &socket,
+                1001,
+                6000,
+                tcp::TcpFlags::ACK,
+                None,
+            ))
+            .unwrap();
+
+        poll_recv_until_pending(&socket).await;
+
+        assert!(socket.ack_initialized.load(Ordering::Relaxed));
+        assert_eq!(socket.ack.load(Ordering::Relaxed), 1001);
     }
 
     #[tokio::test]
-    async fn payload_initializes_ack_and_old_payload_does_not_move_it_back() {
-        let (socket, incoming, _tun) = established_socket(None);
+    async fn sack_zero_fill_still_sends_filler() {
+        let (socket, incoming, tun) = socket_with_state(None, State::Established);
 
         incoming
-            .send(inbound_packet(&socket, 100, 0, Some(b"data")))
+            .send(inbound_sack_packet(
+                &socket, 1001, 5000, 5120, 5300, b"data",
+            ))
             .unwrap();
 
         let mut buf = BytesMut::new();
         assert_eq!(socket.recv(&mut buf).await, Some(4));
         assert_eq!(&buf[..], b"data");
-        assert!(socket.ack_initialized.load(Ordering::Relaxed));
-        assert_eq!(socket.ack.load(Ordering::Relaxed), 104);
+        assert_eq!(socket.ack.load(Ordering::Relaxed), 1001);
 
-        buf.clear();
-        incoming
-            .send(inbound_packet(&socket, 50, 0, Some(b"old")))
-            .unwrap();
-
-        assert_eq!(socket.recv(&mut buf).await, Some(3));
-        assert_eq!(&buf[..], b"old");
-        assert_eq!(socket.ack.load(Ordering::Relaxed), 104);
+        let sent = tun.sent_packets();
+        assert_eq!(sent.len(), 1);
+        let (_, _, _, tcp_packet) = parse_ip_packet(&sent[0]).unwrap();
+        assert_eq!(tcp_packet.get_sequence(), 5000);
+        assert_eq!(tcp_packet.get_acknowledgement(), 1001);
+        assert_eq!(tcp_packet.get_flags(), tcp::TcpFlags::ACK);
+        assert_eq!(tcp_packet.payload().len(), 120);
+        assert!(tcp_packet.payload().iter().all(|&b| b == 0));
     }
 
     #[tokio::test]
-    async fn zero_filler_payload_is_dropped_and_does_not_initialize_ack() {
-        let (socket, incoming, _tun) = established_socket(None);
+    async fn zero_filler_payload_is_dropped_before_upper_layer() {
+        let (socket, incoming, _tun) = socket_with_state(None, State::Established);
 
         incoming
-            .send(inbound_packet(&socket, 100, 0, Some(&[0, 0, 0, 0])))
+            .send(inbound_packet(
+                &socket,
+                4000,
+                0,
+                tcp::TcpFlags::ACK,
+                Some(&[0, 0, 0, 0]),
+            ))
             .unwrap();
         incoming
-            .send(inbound_packet(&socket, 50, 0, Some(b"real")))
+            .send(inbound_packet(
+                &socket,
+                1001,
+                0,
+                tcp::TcpFlags::ACK,
+                Some(b"real"),
+            ))
             .unwrap();
 
         let mut buf = BytesMut::new();
         assert_eq!(socket.recv(&mut buf).await, Some(4));
         assert_eq!(&buf[..], b"real");
-        assert_eq!(socket.ack.load(Ordering::Relaxed), 54);
-
-        buf.clear();
-        incoming
-            .send(inbound_packet(&socket, 54, 0, Some(&[0, 0, 0, 0])))
-            .unwrap();
-        incoming
-            .send(inbound_packet(&socket, 50, 0, Some(b"old")))
-            .unwrap();
-
-        assert_eq!(socket.recv(&mut buf).await, Some(3));
-        assert_eq!(&buf[..], b"old");
-        assert_eq!(socket.ack.load(Ordering::Relaxed), 58);
-    }
-
-    #[tokio::test]
-    async fn sack_zero_fill_sends_filler_and_fast_forwards_seq() {
-        let (socket, incoming, tun) = established_socket(None);
-
-        incoming
-            .send(inbound_sack_packet(&socket, 100, 1000, 1120, 1300, b"data"))
-            .unwrap();
-
-        let mut buf = BytesMut::new();
-        assert_eq!(socket.recv(&mut buf).await, Some(4));
-        assert_eq!(&buf[..], b"data");
-
-        let sent = tun.sent_packets();
-        assert_eq!(sent.len(), 1);
-        let (_, _, _, tcp_packet) = parse_ip_packet(&sent[0]).unwrap();
-        assert_eq!(tcp_packet.get_sequence(), 1000);
-        assert_eq!(tcp_packet.get_acknowledgement(), 104);
-        assert_eq!(tcp_packet.get_flags(), tcp::TcpFlags::ACK);
-        assert_eq!(tcp_packet.payload().len(), 120);
-        assert!(tcp_packet.payload().iter().all(|&b| b == 0));
-        assert_eq!(socket.seq.load(Ordering::Relaxed), 1120);
+        assert_eq!(socket.ack.load(Ordering::Relaxed), 1001);
     }
 }
