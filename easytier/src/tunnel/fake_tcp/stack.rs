@@ -59,6 +59,7 @@ use tracing::{info, trace, warn};
 const TIMEOUT: time::Duration = time::Duration::from_secs(1);
 const RETRIES: usize = 6;
 const MPMC_BUFFER_LEN: usize = 512;
+const MAX_UNACKED_LEN: u32 = 128 * 1024 * 1024; // 128MB
 fn seq_after(seq: u32, other: u32) -> bool {
     seq != other && seq.wrapping_sub(other) < (1u32 << 31)
 }
