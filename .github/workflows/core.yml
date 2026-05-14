@@ -103,7 +103,7 @@ jobs:
         with:
           target: ${{ matrix.TARGET }}
           gui: true
-          pnpm: true
+          pnpm: false
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - uses: Swatinem/rust-cache@v2
@@ -218,7 +218,7 @@ jobs:
 
   docker-image-ci:
     needs: [ pre_job, build_web, build ]
-    if: needs.pre_job.result == 'success' && needs.pre_job.outputs.should_skip != 'true' && !(github.event_name == 'push' && github.ref_name == 'faketcp-ci-artifacts') && !cancelled()
+    if: needs.pre_job.result == 'success' && needs.pre_job.outputs.should_skip != 'true' && needs.build.result == 'success' && !(github.event_name == 'push' && github.ref_name == 'faketcp-ci-artifacts') && !cancelled()
     permissions:
       actions: read
       contents: read
@@ -230,7 +230,7 @@ jobs:
 
   docker-image-publish:
     needs: [ pre_job, build_web, build ]
-    if: needs.pre_job.result == 'success' && needs.pre_job.outputs.should_skip != 'true' && github.event_name == 'push' && github.ref_name == 'faketcp-ci-artifacts' && !cancelled()
+    if: needs.pre_job.result == 'success' && needs.pre_job.outputs.should_skip != 'true' && needs.build.result == 'success' && github.event_name == 'push' && github.ref_name == 'faketcp-ci-artifacts' && !cancelled()
     permissions:
       actions: read
       contents: read
@@ -244,7 +244,7 @@ jobs:
   publish-test-release:
     runs-on: ubuntu-latest
     needs: [ pre_job, build_web, build, docker-image-publish ]
-    if: github.event_name == 'push' && github.ref_name == 'faketcp-ci-artifacts' && needs.pre_job.result == 'success' && needs.pre_job.outputs.should_skip != 'true' && !cancelled()
+    if: github.event_name == 'push' && github.ref_name == 'faketcp-ci-artifacts' && needs.pre_job.result == 'success' && needs.pre_job.outputs.should_skip != 'true' && needs.build.result == 'success' && needs.docker-image-publish.result == 'success' && !cancelled()
     permissions:
       actions: read
       contents: write
