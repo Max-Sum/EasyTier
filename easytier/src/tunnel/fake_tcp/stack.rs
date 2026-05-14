@@ -49,7 +49,7 @@ use std::fmt;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{
     Arc, RwLock,
-    atomic::{AtomicU32, Ordering},
+    atomic::{AtomicBool, AtomicU32, Ordering},
 };
 use tokio::sync::broadcast;
 use tokio::time;
@@ -60,6 +60,21 @@ const TIMEOUT: time::Duration = time::Duration::from_secs(1);
 const RETRIES: usize = 6;
 const MPMC_BUFFER_LEN: usize = 512;
 const MAX_UNACKED_LEN: u32 = 128 * 1024 * 1024; // 128MB
+
+fn seq_after(a: u32, b: u32) -> bool {
+    a != b && a.wrapping_sub(b) < (1u32 << 31)
+}
+
+fn advance_atomic_u32(atom: &AtomicU32, new: u32) {
+    let mut current = atom.load(Ordering::Relaxed);
+
+    while seq_after(new, current) {
+        match atom.compare_exchange_weak(current, new, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return,
+            Err(next) => current = next,
+        }
+    }
+}
 
 #[async_trait::async_trait]
 pub trait Tun: Send + Sync + 'static {
@@ -117,6 +132,8 @@ pub struct Socket {
     seq: AtomicU32,
     ack: AtomicU32,
     last_ack: AtomicU32,
+    seq_initialized: AtomicBool,
+    ack_initialized: AtomicBool,
     state: AtomicCell<State>,
 }
 
@@ -153,10 +170,38 @@ impl Socket {
                 seq: AtomicU32::new(0),
                 ack: AtomicU32::new(ack.unwrap_or(0)),
                 last_ack: AtomicU32::new(ack.unwrap_or(0)),
+                seq_initialized: AtomicBool::new(false),
+                ack_initialized: AtomicBool::new(ack.is_some()),
                 state: AtomicCell::new(state),
             },
             incoming_tx,
         )
+    }
+
+    fn sync_seq_from_peer_ack(&self, peer_ack: u32) {
+        if self
+            .seq_initialized
+            .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            self.seq.store(peer_ack, Ordering::Relaxed);
+        } else {
+            advance_atomic_u32(&self.seq, peer_ack);
+        }
+    }
+
+    fn sync_ack_from_peer_payload(&self, peer_seq: u32, payload_len: usize) {
+        let next_ack = peer_seq.wrapping_add(payload_len as u32);
+
+        if self
+            .ack_initialized
+            .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            self.ack.store(next_ack, Ordering::Relaxed);
+        } else {
+            advance_atomic_u32(&self.ack, next_ack);
+        }
     }
 
     fn build_tcp_packet(&self, flags: u8, payload: Option<&[u8]>) -> Bytes {
@@ -245,17 +290,26 @@ impl Socket {
                         return None;
                     }
 
-                    if (tcp_packet.get_flags() & tcp::TcpFlags::ACK) != 0
-                        && tcp_packet.payload().is_empty()
-                    {
-                        self.seq
-                            .store(tcp_packet.get_acknowledgement(), Ordering::Relaxed);
+                    if (tcp_packet.get_flags() & tcp::TcpFlags::ACK) != 0 {
+                        self.sync_seq_from_peer_ack(tcp_packet.get_acknowledgement());
                     }
 
                     let payload = tcp_packet.payload();
+                    let is_zero_filler = !payload.is_empty() && payload.iter().all(|&b| b == 0);
 
-                    let new_ack = tcp_packet.get_sequence().wrapping_add(payload.len() as u32);
-                    self.ack.store(new_ack, Ordering::Relaxed);
+                    if is_zero_filler {
+                        if self.ack_initialized.load(Ordering::Relaxed) {
+                            self.sync_ack_from_peer_payload(
+                                tcp_packet.get_sequence(),
+                                payload.len(),
+                            );
+                        }
+                        continue;
+                    }
+
+                    if !payload.is_empty() {
+                        self.sync_ack_from_peer_payload(tcp_packet.get_sequence(), payload.len());
+                    }
 
                     for opt in tcp_packet.get_options_iter() {
                         if opt.get_number() == TcpOptionNumbers::SACK {
@@ -290,6 +344,8 @@ impl Socket {
 
                                 if let Err(e) = self.tun.try_send(&buf) {
                                     tracing::error!("Failed to send SACK response: {}", e);
+                                } else {
+                                    self.sync_seq_from_peer_ack(left.wrapping_add(send_len as u32));
                                 }
                                 break;
                             }
@@ -327,7 +383,9 @@ impl Socket {
                         self.seq
                             .store(tcp_packet.get_acknowledgement(), Ordering::Relaxed);
                         self.ack
-                            .store(tcp_packet.get_sequence() + 1, Ordering::Relaxed);
+                            .store(tcp_packet.get_sequence().wrapping_add(1), Ordering::Relaxed);
+                        self.seq_initialized.store(true, Ordering::Relaxed);
+                        self.ack_initialized.store(true, Ordering::Relaxed);
                         self.remote_mac.store(Some(src_mac));
                         self.state.store(State::Established);
                         return Some(0);
@@ -447,7 +505,7 @@ impl Stack {
             remote_addr,
             self.local_mac,
             None,
-            Some(0), // Initial ACK
+            None, // ACK is unknown until first real peer payload
             state,
         );
         assert!(tuples.insert(tuple, incoming).is_none());
@@ -538,5 +596,286 @@ impl Stack {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use pnet::packet::ipv4;
+    use std::sync::Mutex;
+    use tokio::time::{Duration, timeout};
+
+    struct MockTun {
+        sent: Mutex<Vec<Bytes>>,
+    }
+
+    impl MockTun {
+        fn new() -> Self {
+            Self {
+                sent: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn sent_packets(&self) -> Vec<Bytes> {
+            self.sent.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Tun for MockTun {
+        async fn recv(&self, _packet: &mut BytesMut) -> Result<usize, std::io::Error> {
+            std::future::pending::<Result<usize, std::io::Error>>().await
+        }
+
+        fn try_send(&self, packet: &Bytes) -> Result<(), std::io::Error> {
+            self.sent.lock().unwrap().push(packet.clone());
+            Ok(())
+        }
+
+        fn driver_type(&self) -> &'static str {
+            "mock"
+        }
+    }
+
+    fn test_mac(id: u8) -> MacAddr {
+        MacAddr::new(0, 1, 2, 3, 4, id)
+    }
+
+    fn established_socket(ack: Option<u32>) -> (Socket, flume::Sender<Bytes>, Arc<MockTun>) {
+        let tun = Arc::new(MockTun::new());
+        let tun_trait: Arc<dyn Tun> = tun.clone();
+        let (tuples_purge, _) = broadcast::channel(16);
+        let shared = Arc::new(Shared {
+            tuples: RwLock::new(HashMap::new()),
+            listening: RwLock::new(HashSet::new()),
+            tun: tun_trait.clone(),
+            tuples_purge,
+        });
+        let local_addr = "10.0.0.1:10000".parse().unwrap();
+        let remote_addr = "10.0.0.2:20000".parse().unwrap();
+        let (socket, incoming) = Socket::new(
+            shared.clone(),
+            tun_trait,
+            local_addr,
+            remote_addr,
+            test_mac(1),
+            Some(test_mac(2)),
+            ack,
+            State::Established,
+        );
+        shared
+            .tuples
+            .write()
+            .unwrap()
+            .insert(AddrTuple::new(local_addr, remote_addr), incoming.clone());
+
+        (socket, incoming, tun)
+    }
+
+    fn inbound_packet(socket: &Socket, seq: u32, ack: u32, payload: Option<&[u8]>) -> Bytes {
+        build_tcp_packet(
+            test_mac(2),
+            test_mac(1),
+            socket.remote_addr,
+            socket.local_addr,
+            seq,
+            ack,
+            tcp::TcpFlags::ACK,
+            payload,
+        )
+    }
+
+    fn inbound_sack_packet(
+        socket: &Socket,
+        seq: u32,
+        ack: u32,
+        first_sack_left: u32,
+        first_sack_right: u32,
+        payload: &[u8],
+    ) -> Bytes {
+        const ETH_HEADER_LEN: usize = 14;
+        const IPV4_HEADER_LEN: usize = 20;
+        const TCP_HEADER_LEN: usize = 20;
+
+        let base = inbound_packet(socket, seq, ack, Some(payload));
+        let tcp_start = ETH_HEADER_LEN + IPV4_HEADER_LEN;
+        let payload_start = tcp_start + TCP_HEADER_LEN;
+        let mut options = [0u8; 12];
+        options[0] = 5;
+        options[1] = 10;
+        options[2..6].copy_from_slice(&first_sack_left.to_be_bytes());
+        options[6..10].copy_from_slice(&first_sack_right.to_be_bytes());
+        options[10] = 1;
+        options[11] = 1;
+
+        let mut packet = Vec::with_capacity(base.len() + options.len());
+        packet.extend_from_slice(&base[..payload_start]);
+        packet.extend_from_slice(&options);
+        packet.extend_from_slice(&base[payload_start..]);
+
+        let total_len = (IPV4_HEADER_LEN + TCP_HEADER_LEN + options.len() + payload.len()) as u16;
+        packet[ETH_HEADER_LEN + 2..ETH_HEADER_LEN + 4].copy_from_slice(&total_len.to_be_bytes());
+        let tcp_header_words = ((TCP_HEADER_LEN + options.len()) / 4) as u8;
+        packet[tcp_start + 12] = tcp_header_words << 4;
+
+        {
+            let mut ipv4_packet =
+                ipv4::MutableIpv4Packet::new(&mut packet[ETH_HEADER_LEN..]).unwrap();
+            ipv4_packet.set_checksum(0);
+            let checksum = ipv4::checksum(&ipv4_packet.to_immutable());
+            ipv4_packet.set_checksum(checksum);
+        }
+
+        {
+            let mut tcp_packet = tcp::MutableTcpPacket::new(&mut packet[tcp_start..]).unwrap();
+            tcp_packet.set_checksum(0);
+            let (src, dst) = match (socket.remote_addr, socket.local_addr) {
+                (SocketAddr::V4(src), SocketAddr::V4(dst)) => (*src.ip(), *dst.ip()),
+                _ => unreachable!(),
+            };
+            let checksum = tcp::ipv4_checksum(&tcp_packet.to_immutable(), &src, &dst);
+            tcp_packet.set_checksum(checksum);
+        }
+
+        Bytes::from(packet)
+    }
+
+    async fn poll_recv_until_pending(socket: &Socket) {
+        let mut buf = BytesMut::new();
+        assert!(
+            timeout(Duration::from_millis(10), socket.recv(&mut buf))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn first_ack_initializes_seq() {
+        let (socket, incoming, _tun) = established_socket(None);
+
+        incoming
+            .send(inbound_packet(&socket, 10, 5000, None))
+            .unwrap();
+
+        poll_recv_until_pending(&socket).await;
+
+        assert!(socket.seq_initialized.load(Ordering::Relaxed));
+        assert_eq!(socket.seq.load(Ordering::Relaxed), 5000);
+    }
+
+    #[tokio::test]
+    async fn old_ack_does_not_move_seq_back() {
+        let (socket, incoming, _tun) = established_socket(None);
+
+        incoming
+            .send(inbound_packet(&socket, 10, 1000, None))
+            .unwrap();
+        incoming
+            .send(inbound_packet(&socket, 11, 800, None))
+            .unwrap();
+
+        poll_recv_until_pending(&socket).await;
+
+        assert_eq!(socket.seq.load(Ordering::Relaxed), 1000);
+    }
+
+    #[tokio::test]
+    async fn server_established_socket_starts_with_uninitialized_ack() {
+        let tun = Arc::new(MockTun::new());
+        let tun_trait: Arc<dyn Tun> = tun;
+        let mut stack = Stack::new(
+            tun_trait,
+            "10.0.0.1".parse().unwrap(),
+            None,
+            Some(test_mac(1)),
+        );
+        let socket = stack
+            .alloc_established_socket(
+                "10.0.0.1:10000".parse().unwrap(),
+                "10.0.0.2:20000".parse().unwrap(),
+                State::Established,
+            )
+            .await;
+
+        assert!(!socket.ack_initialized.load(Ordering::Relaxed));
+        assert_eq!(socket.ack.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn payload_initializes_ack_and_old_payload_does_not_move_it_back() {
+        let (socket, incoming, _tun) = established_socket(None);
+
+        incoming
+            .send(inbound_packet(&socket, 100, 0, Some(b"data")))
+            .unwrap();
+
+        let mut buf = BytesMut::new();
+        assert_eq!(socket.recv(&mut buf).await, Some(4));
+        assert_eq!(&buf[..], b"data");
+        assert!(socket.ack_initialized.load(Ordering::Relaxed));
+        assert_eq!(socket.ack.load(Ordering::Relaxed), 104);
+
+        buf.clear();
+        incoming
+            .send(inbound_packet(&socket, 50, 0, Some(b"old")))
+            .unwrap();
+
+        assert_eq!(socket.recv(&mut buf).await, Some(3));
+        assert_eq!(&buf[..], b"old");
+        assert_eq!(socket.ack.load(Ordering::Relaxed), 104);
+    }
+
+    #[tokio::test]
+    async fn zero_filler_payload_is_dropped_and_does_not_initialize_ack() {
+        let (socket, incoming, _tun) = established_socket(None);
+
+        incoming
+            .send(inbound_packet(&socket, 100, 0, Some(&[0, 0, 0, 0])))
+            .unwrap();
+        incoming
+            .send(inbound_packet(&socket, 50, 0, Some(b"real")))
+            .unwrap();
+
+        let mut buf = BytesMut::new();
+        assert_eq!(socket.recv(&mut buf).await, Some(4));
+        assert_eq!(&buf[..], b"real");
+        assert_eq!(socket.ack.load(Ordering::Relaxed), 54);
+
+        buf.clear();
+        incoming
+            .send(inbound_packet(&socket, 54, 0, Some(&[0, 0, 0, 0])))
+            .unwrap();
+        incoming
+            .send(inbound_packet(&socket, 50, 0, Some(b"old")))
+            .unwrap();
+
+        assert_eq!(socket.recv(&mut buf).await, Some(3));
+        assert_eq!(&buf[..], b"old");
+        assert_eq!(socket.ack.load(Ordering::Relaxed), 58);
+    }
+
+    #[tokio::test]
+    async fn sack_zero_fill_sends_filler_and_fast_forwards_seq() {
+        let (socket, incoming, tun) = established_socket(None);
+
+        incoming
+            .send(inbound_sack_packet(&socket, 100, 1000, 1120, 1300, b"data"))
+            .unwrap();
+
+        let mut buf = BytesMut::new();
+        assert_eq!(socket.recv(&mut buf).await, Some(4));
+        assert_eq!(&buf[..], b"data");
+
+        let sent = tun.sent_packets();
+        assert_eq!(sent.len(), 1);
+        let (_, _, _, tcp_packet) = parse_ip_packet(&sent[0]).unwrap();
+        assert_eq!(tcp_packet.get_sequence(), 1000);
+        assert_eq!(tcp_packet.get_acknowledgement(), 104);
+        assert_eq!(tcp_packet.get_flags(), tcp::TcpFlags::ACK);
+        assert_eq!(tcp_packet.payload().len(), 120);
+        assert!(tcp_packet.payload().iter().all(|&b| b == 0));
+        assert_eq!(socket.seq.load(Ordering::Relaxed), 1120);
     }
 }
