@@ -223,49 +223,6 @@ impl Socket {
         }
     }
 
-    fn send_sack_zero_fill(&self, tcp_packet: &tcp::TcpPacket<'_>) {
-        for opt in tcp_packet.get_options_iter() {
-            if opt.get_number() != TcpOptionNumbers::SACK {
-                continue;
-            }
-
-            let payload = opt.payload();
-            for chunk in payload.chunks(8) {
-                if chunk.len() != 8 {
-                    continue;
-                }
-
-                let left = tcp_packet.get_acknowledgement();
-                let right = u32::from_be_bytes(chunk[0..4].try_into().unwrap());
-                let len = right.wrapping_sub(left);
-
-                let sack_end = u32::from_be_bytes(chunk[4..8].try_into().unwrap());
-                if len == 0 || sack_end <= left {
-                    continue;
-                }
-
-                let send_len = std::cmp::min(len, 1400) as usize;
-                let data = vec![0u8; send_len];
-
-                let buf = build_tcp_packet(
-                    self.local_mac,
-                    self.remote_mac.load().unwrap_or(MacAddr::zero()),
-                    self.local_addr,
-                    self.remote_addr,
-                    left,
-                    self.rcv_nxt.load(Ordering::Relaxed),
-                    tcp::TcpFlags::ACK,
-                    Some(&data),
-                );
-
-                if let Err(e) = self.tun.try_send(&buf) {
-                    tracing::error!("Failed to send SACK zero filler: {}", e);
-                }
-                break;
-            }
-        }
-    }
-
     /// Sends a datagram to the other end.
     ///
     /// This method takes `&self`, and it can be called safely by multiple threads
@@ -344,10 +301,48 @@ impl Socket {
 
                     if (tcp_packet.get_flags() & tcp::TcpFlags::ACK) != 0 {
                         self.handle_ack(tcp_packet.get_acknowledgement());
-                        self.send_sack_zero_fill(&tcp_packet);
                     }
 
                     let payload = tcp_packet.payload();
+
+                    for opt in tcp_packet.get_options_iter() {
+                        if opt.get_number() == TcpOptionNumbers::SACK {
+                            // SACK 选项类型为 5
+                            let payload = opt.payload();
+                            for chunk in payload.chunks(8) {
+                                if chunk.len() != 8 {
+                                    continue;
+                                }
+                                let left = tcp_packet.get_acknowledgement();
+                                let right = u32::from_be_bytes(chunk[0..4].try_into().unwrap());
+                                let len = right.wrapping_sub(left);
+
+                                let sack_end = u32::from_be_bytes(chunk[4..8].try_into().unwrap());
+                                if len == 0 || sack_end <= left {
+                                    continue;
+                                }
+
+                                let send_len = std::cmp::min(len, 1400) as usize;
+                                let data = vec![0u8; send_len];
+
+                                let buf = build_tcp_packet(
+                                    self.local_mac,
+                                    self.remote_mac.load().unwrap_or(MacAddr::zero()),
+                                    self.local_addr,
+                                    self.remote_addr,
+                                    left,
+                                    self.rcv_nxt.load(Ordering::Relaxed),
+                                    tcp::TcpFlags::ACK,
+                                    Some(&data),
+                                );
+
+                                if let Err(e) = self.tun.try_send(&buf) {
+                                    tracing::error!("Failed to send SACK response: {}", e);
+                                }
+                                break;
+                            }
+                        }
+                    }
 
                     if payload.is_empty() {
                         continue;
