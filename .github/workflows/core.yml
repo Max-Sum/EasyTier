@@ -2,7 +2,7 @@ name: EasyTier Core
 
 on:
   push:
-    branches: [ "develop", "main", "releases/**" ]
+    branches: [ "develop", "main", "releases/**", "faketcp-ci-artifacts" ]
   pull_request:
     branches: [ "develop", "main" ]
     types: [ opened, synchronize, reopened, ready_for_review ]
@@ -27,7 +27,7 @@ jobs:
     # Map a step output to a job output
     outputs:
       # do not skip push on branch starts with releases/
-      should_skip: ${{ steps.skip_check.outputs.should_skip == 'true' && !startsWith(github.ref_name, 'releases/') }}
+      should_skip: ${{ steps.skip_check.outputs.should_skip == 'true' && !startsWith(github.ref_name, 'releases/') && github.ref_name != 'faketcp-ci-artifacts' }}
     steps:
       - id: skip_check
         uses: fkirc/skip-duplicate-actions@v5
@@ -36,7 +36,7 @@ jobs:
           concurrent_skipping: 'same_content_newer'
           skip_after_successful_duplicate: 'true'
           cancel_others: 'true'
-          paths: '["Cargo.toml", "Cargo.lock", "easytier/**", ".github/workflows/core.yml", ".github/actions/**", "easytier-web/**"]'
+          paths: '["Cargo.toml", "Cargo.lock", "easytier/**", "easytier-gui/**", ".github/workflows/core.yml", ".github/workflows/docker.yml", ".github/workflows/Dockerfile", ".github/actions/**", "easytier-web/**"]'
   build_web:
     runs-on: ubuntu-latest
     needs: pre_job
@@ -67,41 +67,6 @@ jobs:
             OS: ubuntu-24.04-arm
             ARTIFACT_NAME: linux-aarch64
 
-          - TARGET: riscv64gc-unknown-linux-musl
-            OS: ubuntu-24.04
-            ARTIFACT_NAME: linux-riscv64
-          - TARGET: loongarch64-unknown-linux-musl
-            OS: ubuntu-24.04
-            ARTIFACT_NAME: linux-loongarch64
-
-          - TARGET: armv7-unknown-linux-musleabihf # raspberry pi 2-3-4, not tested
-            OS: ubuntu-24.04
-            ARTIFACT_NAME: linux-armv7hf
-          - TARGET: armv7-unknown-linux-musleabi # raspberry pi 2-3-4, not tested
-            OS: ubuntu-24.04
-            ARTIFACT_NAME: linux-armv7
-          - TARGET: arm-unknown-linux-musleabihf # raspberry pi 0-1, not tested
-            OS: ubuntu-24.04
-            ARTIFACT_NAME: linux-armhf
-          - TARGET: arm-unknown-linux-musleabi # raspberry pi 0-1, not tested
-            OS: ubuntu-24.04
-            ARTIFACT_NAME: linux-arm
-
-          - TARGET: mips-unknown-linux-musl
-            OS: ubuntu-24.04
-            ARTIFACT_NAME: linux-mips
-          - TARGET: mipsel-unknown-linux-musl
-            OS: ubuntu-24.04
-            ARTIFACT_NAME: linux-mipsel
-
-          - TARGET: x86_64-unknown-freebsd
-            OS: ubuntu-24.04
-            ARTIFACT_NAME: freebsd-13.2-x86_64
-            BSD_VERSION: 13.2
-
-          - TARGET: x86_64-apple-darwin
-            OS: macos-latest
-            ARTIFACT_NAME: macos-x86_64
           - TARGET: aarch64-apple-darwin
             OS: macos-latest
             ARTIFACT_NAME: macos-aarch64
@@ -109,12 +74,6 @@ jobs:
           - TARGET: x86_64-pc-windows-msvc
             OS: windows-latest
             ARTIFACT_NAME: windows-x86_64
-          - TARGET: i686-pc-windows-msvc
-            OS: windows-latest
-            ARTIFACT_NAME: windows-i686
-          - TARGET: aarch64-pc-windows-msvc
-            OS: windows-11-arm
-            ARTIFACT_NAME: windows-arm64
 
     runs-on: ${{ matrix.OS }}
     env:
@@ -144,16 +103,17 @@ jobs:
         with:
           target: ${{ matrix.TARGET }}
           gui: true
-          pnpm: true
+          pnpm: false
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - uses: Swatinem/rust-cache@v2
         with:
           # The prefix cache key, this can be changed to start a new cache manually.
           # default: "v0-rust"
-          prefix-key: ""
+          prefix-key: "v1-rust"
           shared-key: "core-registry"
           cache-targets: "false"
+          cache-bin: "false"
 
       - uses: mlugg/setup-zig@v2
         if: ${{ contains(matrix.OS, 'ubuntu') }}
@@ -257,44 +217,203 @@ jobs:
           path: |
             ./artifacts/*
 
-  build_magisk:
-    runs-on: ubuntu-latest
-    needs: [ pre_job, build_web, build ]
-    if: needs.pre_job.result == 'success' && needs.pre_job.outputs.should_skip != 'true' && !cancelled()
-    steps:
-      - name: Checkout Code
-        uses: actions/checkout@v5  # 必须先检出代码才能获取模块配置
+  build_gui:
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - TARGET: x86_64-pc-windows-msvc
+            OS: windows-latest
+            GUI_TARGET: x86_64-pc-windows-msvc
+            ARTIFACT_NAME: windows-x86_64
 
-      # 下载二进制文件到独立目录
-      - name: Download Linux aarch64 binaries
+          - TARGET: aarch64-apple-darwin
+            OS: macos-latest
+            GUI_TARGET: aarch64-apple-darwin
+            ARTIFACT_NAME: macos-aarch64
+
+    runs-on: ${{ matrix.OS }}
+    env:
+      NAME: easytier
+      TARGET: ${{ matrix.TARGET }}
+      OS: ${{ matrix.OS }}
+      GUI_TARGET: ${{ matrix.GUI_TARGET }}
+      OSS_BUCKET: ${{ secrets.ALIYUN_OSS_BUCKET }}
+    needs: pre_job
+    if: needs.pre_job.outputs.should_skip != 'true'
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set current ref as env variable
+        run: |
+          echo "GIT_DESC=$(git log -1 --format=%cd.%h --date=format:%Y-%m-%d_%H:%M:%S)" >> $GITHUB_ENV
+
+      - name: Prepare build environment
+        uses: ./.github/actions/prepare-build
+        with:
+          target: ${{ matrix.TARGET }}
+          gui: true
+          pnpm: true
+          pnpm-build-filter: ''
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: ""
+          shared-key: "gui-registry"
+          cache-targets: "false"
+
+      - name: copy correct DLLs
+        if: ${{ contains(matrix.GUI_TARGET, 'windows') }}
+        run: |
+          case $TARGET in
+              x86_64*)  ARCH_DIR=x86_64 ;;
+              i686*)    ARCH_DIR=i686 ;;
+              aarch64*) ARCH_DIR=arm64 ;;
+          esac
+          if [[ -n "$ARCH_DIR" ]]; then
+              find "./easytier/third_party/${ARCH_DIR}" -maxdepth 1 -type f \( -name "*.dll" -o -name "*.sys" \) -exec cp {} ./easytier-gui/src-tauri/ \;
+          fi
+
+      - name: Build GUI
+        uses: tauri-apps/tauri-action@v0
+        with:
+          projectPath: ./easytier-gui
+          args: --verbose --target ${{ matrix.GUI_TARGET }}
+
+      - name: Collect artifact
+        run: |
+          mkdir -p ./artifacts/objects/
+
+          if [[ $GUI_TARGET =~ windows ]]; then
+              mv ./target/$GUI_TARGET/release/bundle/nsis/*.exe ./artifacts/objects/
+          elif [[ $GUI_TARGET =~ darwin ]]; then
+              mv ./target/$GUI_TARGET/release/bundle/dmg/*.dmg ./artifacts/objects/
+          fi
+
+          mv ./artifacts/objects/* ./artifacts/
+          rm -rf ./artifacts/objects/
+
+      - name: Archive artifact
+        uses: actions/upload-artifact@v5
+        with:
+          name: easytier-gui-${{ matrix.ARTIFACT_NAME }}
+          path: |
+            ./artifacts/*
+
+  docker-image-ci:
+    needs: [ pre_job, build_web, build ]
+    if: needs.pre_job.result == 'success' && needs.pre_job.outputs.should_skip != 'true' && needs.build.result == 'success' && !(github.event_name == 'push' && github.ref_name == 'faketcp-ci-artifacts') && !cancelled()
+    permissions:
+      actions: read
+      contents: read
+      packages: write
+    uses: ./.github/workflows/docker.yml
+    with:
+      push_image: false
+      image_tag: faketcp-ci-${{ github.sha }}
+
+  docker-image-publish:
+    needs: [ pre_job, build_web, build ]
+    if: needs.pre_job.result == 'success' && needs.pre_job.outputs.should_skip != 'true' && needs.build.result == 'success' && github.event_name == 'push' && github.ref_name == 'faketcp-ci-artifacts' && !cancelled()
+    permissions:
+      actions: read
+      contents: read
+      packages: write
+    uses: ./.github/workflows/docker.yml
+    secrets: inherit
+    with:
+      push_image: ${{ github.event_name == 'push' && github.ref_name == 'faketcp-ci-artifacts' }}
+      image_tag: faketcp-ci-${{ github.sha }}
+
+  publish-test-release:
+    runs-on: ubuntu-latest
+    needs: [ pre_job, build_web, build, build_gui, docker-image-publish ]
+    if: github.event_name == 'push' && github.ref_name == 'faketcp-ci-artifacts' && needs.pre_job.result == 'success' && needs.pre_job.outputs.should_skip != 'true' && needs.build.result == 'success' && needs.build_gui.result == 'success' && needs.docker-image-publish.result == 'success' && !cancelled()
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - name: Download current run artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: easytier-linux-x86_64
+          path: release_assets/easytier-linux-x86_64
+
+      - name: Download Linux arm64 artifact
         uses: actions/download-artifact@v4
         with:
           name: easytier-linux-aarch64
-          path: ./downloaded-binaries/  # 独立目录避免冲突
+          path: release_assets/easytier-linux-aarch64
 
-      # 将二进制文件复制到 Magisk 模块目录
-      - name: Prepare binaries
-        run: |
-          mkdir -p ./easytier-contrib/easytier-magisk/
-          cp ./downloaded-binaries/easytier-core ./easytier-contrib/easytier-magisk/
-          cp ./downloaded-binaries/easytier-cli ./easytier-contrib/easytier-magisk/
-          cp ./downloaded-binaries/easytier-web ./easytier-contrib/easytier-magisk/
-
-      # 上传生成的模块
-      - name: Upload Magisk Module
-        uses: actions/upload-artifact@v5
+      - name: Download Windows x64 artifact
+        uses: actions/download-artifact@v4
         with:
-          name: Easytier-Magisk
-          path: |
-            ./easytier-contrib/easytier-magisk
-            !./easytier-contrib/easytier-magisk/build.sh
-            !./easytier-contrib/easytier-magisk/magisk_update.json
-          if-no-files-found: error
+          name: easytier-windows-x86_64
+          path: release_assets/easytier-windows-x86_64
+
+      - name: Download macOS arm64 artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: easytier-macos-aarch64
+          path: release_assets/easytier-macos-aarch64
+
+      - name: Download Windows GUI x64 artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: easytier-gui-windows-x86_64
+          path: release_assets/easytier-gui-windows-x86_64
+
+      - name: Download macOS GUI arm64 artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: easytier-gui-macos-aarch64
+          path: release_assets/easytier-gui-macos-aarch64
+
+      - name: Zip release assets
+        run: |
+          mkdir -p zipped_assets
+
+          cd release_assets
+          for artifact in *; do
+            if [[ -d "$artifact" ]]; then
+              chmod -R 755 "$artifact"
+              (cd "$artifact" && zip -r "../../zipped_assets/${artifact}.zip" .)
+            fi
+          done
+
+          cd ..
+          ls -l ./zipped_assets
+
+      - name: Prepare release metadata
+        id: release-meta
+        run: |
+          OWNER_LC="${GITHUB_REPOSITORY_OWNER,,}"
+          echo "ghcr_image=ghcr.io/${OWNER_LC}/easytier:faketcp-ci-${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Create test release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: faketcp-ci-${{ github.run_number }}
+          target_commitish: ${{ github.sha }}
+          name: EasyTier faketcp CI ${{ github.run_number }} (${{ github.sha }})
+          body: |
+            Test release for faketcp CI artifacts.
+
+            Commit: ${{ github.sha }}
+            GHCR image: ${{ steps.release-meta.outputs.ghcr_image }}
+            Docker Hub image: easytier/easytier:faketcp-ci-${{ github.sha }} (only when Docker Hub secrets are configured)
+          prerelease: true
+          make_latest: false
+          overwrite_files: true
+          fail_on_unmatched_files: true
+          files: |
+            ./zipped_assets/*.zip
 
   core-result:
     runs-on: ubuntu-latest
-    needs: [ pre_job, build_web, build, build_magisk ]
-    if: needs.pre_job.result == 'success' && needs.pre_job.outputs.should_skip != 'true' && !cancelled()
+    needs: [ pre_job, build_web, build, build_gui, docker-image-ci, docker-image-publish, publish-test-release ]
+    if: always() && needs.pre_job.result == 'success' && needs.pre_job.outputs.should_skip != 'true' && !cancelled()
     steps:
       - name: Mark result as failed
         if: contains(needs.*.result, 'failure')

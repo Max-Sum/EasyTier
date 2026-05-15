@@ -1,6 +1,18 @@
 name: EasyTier Docker
 
 on:
+  workflow_call:
+    inputs:
+      push_image:
+        description: 'Push the built image to registries'
+        type: boolean
+        default: false
+        required: false
+      image_tag:
+        description: 'Tag for this image build'
+        type: string
+        default: ''
+        required: false
   workflow_dispatch:
     inputs:
       run_id:
@@ -24,16 +36,28 @@ on:
         default: false
         required: true
 
+permissions:
+  actions: read
+  contents: read
+  packages: write
+
 jobs:
   docker:
-    if: contains('["KKRainbow"]', github.actor)
+    if: github.event_name != 'workflow_dispatch' || contains('["KKRainbow"]', github.actor)
     runs-on: ubuntu-latest
+    env:
+      HAS_DOCKERHUB: ${{ secrets.DOCKERHUB_USERNAME != '' && secrets.DOCKERHUB_TOKEN != '' }}
+      IMAGE_TAG: ${{ inputs.image_tag }}
+      MARK_LATEST: ${{ inputs.mark_latest }}
+      MARK_UNSTABLE: ${{ inputs.mark_unstable }}
+      PUSH_IMAGE: ${{ github.event_name == 'workflow_dispatch' || inputs.push_image }}
     steps:
       -
         name: Checkout
         uses: actions/checkout@v5
       -
         name: Validate inputs
+        if: github.event_name == 'workflow_dispatch'
         run: |
           if [[ "${{ inputs.mark_latest }}" == "true" && "${{ inputs.mark_unstable }}" == "true" ]]; then
             echo "Error: mark_latest and mark_unstable cannot both be true"
@@ -47,17 +71,20 @@ jobs:
         uses: docker/setup-buildx-action@v3
       -
         name: Login to Docker Hub
+        if: env.PUSH_IMAGE == 'true' && env.HAS_DOCKERHUB == 'true'
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
       - name: login github container registry
+        if: env.PUSH_IMAGE == 'true'
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Download artifact
+        if: github.event_name == 'workflow_dispatch'
         id: download-artifact
         uses: dawidd6/action-download-artifact@v11
         with:
@@ -65,39 +92,58 @@ jobs:
           run_id: ${{ inputs.run_id }}
           repo: EasyTier/EasyTier
           path: docker_context
+      - name: Download current run artifacts
+        if: github.event_name != 'workflow_dispatch'
+        uses: actions/download-artifact@v4
+        with:
+          pattern: easytier-linux-*
+          path: docker_context
       - name: List files
         run: |
           ls -l -R .
       - name: Prepare Docker tags
         id: tags
         run: |
-          # Base tags with version
-          DOCKERHUB_TAGS="easytier/easytier:${{ inputs.image_tag }}"
-          GHCR_TAGS="ghcr.io/easytier/easytier:${{ inputs.image_tag }}"
+          OWNER_LC="${GITHUB_REPOSITORY_OWNER,,}"
+
+          if [[ "$PUSH_IMAGE" != "true" ]]; then
+            echo "tags=ghcr.io/${OWNER_LC}/easytier:ci-${GITHUB_SHA::12}" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          if [[ -z "$IMAGE_TAG" ]]; then
+            IMAGE_TAG="ci-${GITHUB_SHA::12}"
+          fi
+
+          TAGS="ghcr.io/${OWNER_LC}/easytier:${IMAGE_TAG}"
+          if [[ "$HAS_DOCKERHUB" == "true" ]]; then
+            TAGS="easytier/easytier:${IMAGE_TAG},${TAGS}"
+          fi
 
           # Add latest tags if requested
-          if [[ "${{ inputs.mark_latest }}" == "true" ]]; then
-            DOCKERHUB_TAGS="${DOCKERHUB_TAGS},easytier/easytier:latest"
-            GHCR_TAGS="${GHCR_TAGS},ghcr.io/easytier/easytier:latest"
+          if [[ "$MARK_LATEST" == "true" ]]; then
+            TAGS="${TAGS},ghcr.io/${OWNER_LC}/easytier:latest"
+            if [[ "$HAS_DOCKERHUB" == "true" ]]; then
+              TAGS="${TAGS},easytier/easytier:latest"
+            fi
           fi
 
           # Add unstable tags if requested
-          if [[ "${{ inputs.mark_unstable }}" == "true" ]]; then
-            DOCKERHUB_TAGS="${DOCKERHUB_TAGS},easytier/easytier:unstable"
-            GHCR_TAGS="${GHCR_TAGS},ghcr.io/easytier/easytier:unstable"
+          if [[ "$MARK_UNSTABLE" == "true" ]]; then
+            TAGS="${TAGS},ghcr.io/${OWNER_LC}/easytier:unstable"
+            if [[ "$HAS_DOCKERHUB" == "true" ]]; then
+              TAGS="${TAGS},easytier/easytier:unstable"
+            fi
           fi
 
-          # Combine all tags
-          ALL_TAGS="${DOCKERHUB_TAGS},${GHCR_TAGS}"
-
-          echo "tags=${ALL_TAGS}" >> $GITHUB_OUTPUT
-          echo "Generated tags: ${ALL_TAGS}"
+          echo "tags=${TAGS}" >> $GITHUB_OUTPUT
+          echo "Generated tags: ${TAGS}"
       -
         name: Build and push
         uses: docker/build-push-action@v6
         with:
           context: ./docker_context
-          platforms: linux/amd64,linux/arm/v6,linux/arm/v7,linux/arm64,linux/riscv64
-          push: true
+          platforms: linux/amd64,linux/arm64
+          push: ${{ env.PUSH_IMAGE == 'true' }}
           file: .github/workflows/Dockerfile
           tags: ${{ steps.tags.outputs.tags }}

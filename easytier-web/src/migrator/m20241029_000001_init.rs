@@ -56,6 +56,7 @@ enum UserRunningNetworkConfigs {
     DeviceId,
     NetworkInstanceId,
     NetworkConfig,
+    Source,
     Disabled,
     CreateTime,
     UpdateTime,
@@ -186,13 +187,14 @@ impl MigrationTrait for Migration {
                     .table(UserRunningNetworkConfigs::Table)
                     .col(pk_auto(UserRunningNetworkConfigs::Id).not_null())
                     .col(integer(UserRunningNetworkConfigs::UserId).not_null())
-                    .col(text(UserRunningNetworkConfigs::DeviceId).not_null())
-                    .col(
-                        text(UserRunningNetworkConfigs::NetworkInstanceId)
-                            .unique_key()
-                            .not_null(),
-                    )
+                    .col(string(UserRunningNetworkConfigs::DeviceId).not_null())
+                    .col(string(UserRunningNetworkConfigs::NetworkInstanceId).not_null())
                     .col(text(UserRunningNetworkConfigs::NetworkConfig).not_null())
+                    .col(
+                        string(UserRunningNetworkConfigs::Source)
+                            .not_null()
+                            .default("user"),
+                    )
                     .col(
                         boolean(UserRunningNetworkConfigs::Disabled)
                             .not_null()
@@ -211,6 +213,18 @@ impl MigrationTrait for Migration {
                             .on_delete(ForeignKeyAction::Cascade)
                             .on_update(ForeignKeyAction::Cascade),
                     )
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_user_running_network_configs_scope_inst")
+                    .table(UserRunningNetworkConfigs::Table)
+                    .col(UserRunningNetworkConfigs::UserId)
+                    .col(UserRunningNetworkConfigs::DeviceId)
+                    .col(UserRunningNetworkConfigs::NetworkInstanceId)
+                    .unique()
                     .to_owned(),
             )
             .await?;
@@ -284,7 +298,7 @@ impl MigrationTrait for Migration {
                     .column((Groups::Table, Groups::Id))
                     .column((Permissions::Table, Permissions::Id))
                     .from(Groups::Table)
-                    .full_outer_join(Permissions::Table, all![])
+                    .inner_join(Permissions::Table, Expr::cust("1 = 1"))
                     .cond_where(any![
                         // users have devices permission
                         Expr::col((Groups::Table, Groups::Name))
@@ -307,7 +321,7 @@ impl MigrationTrait for Migration {
                     .column((Users::Table, Users::Id))
                     .column((Groups::Table, Groups::Id))
                     .from(Users::Table)
-                    .full_outer_join(Groups::Table, all![])
+                    .inner_join(Groups::Table, Expr::cust("1 = 1"))
                     .cond_where(
                         Expr::col(Users::Username)
                             .eq("user")
@@ -327,7 +341,7 @@ impl MigrationTrait for Migration {
                     .column((Users::Table, Users::Id))
                     .column((Groups::Table, Groups::Id))
                     .from(Users::Table)
-                    .full_outer_join(Groups::Table, all![])
+                    .inner_join(Groups::Table, Expr::cust("1 = 1"))
                     .cond_where(
                         Expr::col(Users::Username)
                             .eq("admin")

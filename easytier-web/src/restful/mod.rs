@@ -13,7 +13,6 @@ use axum::middleware::{self as axum_mw, Next};
 use axum::response::Response;
 use axum::routing::{delete, post};
 use axum::{Extension, Json, Router, extract::State, routing::get};
-use axum_login::tower_sessions::{ExpiredDeletion, SessionManagerLayer};
 use axum_login::{AuthManagerLayerBuilder, AuthUser, AuthzBackend, login_required};
 use axum_messages::MessagesManagerLayer;
 use easytier::common::config::{ConfigLoader, TomlConfigLoader};
@@ -23,16 +22,18 @@ use network::NetworkApi;
 use sea_orm::DbErr;
 use tokio::net::TcpListener;
 use tokio_util::task::AbortOnDropHandle;
-use tower_sessions::Expiry;
 use tower_sessions::cookie::time::Duration;
 use tower_sessions::cookie::{Key, SameSite};
-use tower_sessions_sqlx_store::SqliteStore;
+use tower_sessions::session::{Id, Record};
+use tower_sessions::session_store::{self, ExpiredDeletion};
+use tower_sessions::{Expiry, SessionManagerLayer, SessionStore};
+use tower_sessions_sqlx_store::{MySqlStore, PostgresStore, SqliteStore};
 use users::{AuthSession, Backend};
 
 use crate::FeatureFlags;
 use crate::client_manager::ClientManager;
 use crate::client_manager::storage::StorageToken;
-use crate::db::{Db, UserIdInDb};
+use crate::db::{Db, DbPool, UserIdInDb};
 use crate::webhook::SharedWebhookConfig;
 
 /// Embed assets for web dashboard, build frontend first
@@ -53,6 +54,95 @@ pub struct RestfulServer {
 
 type AppStateInner = Arc<ClientManager>;
 type AppState = State<AppStateInner>;
+
+#[derive(Debug, Clone)]
+enum SqlxSessionStore {
+    Sqlite(SqliteStore),
+    Postgres(PostgresStore),
+    MySql(MySqlStore),
+}
+
+impl SqlxSessionStore {
+    fn from_db(db: &Db) -> anyhow::Result<Self> {
+        Ok(match db.pool() {
+            DbPool::Sqlite(pool) => Self::Sqlite(SqliteStore::new(pool.clone())),
+            DbPool::Postgres(pool) => Self::Postgres(
+                PostgresStore::new(pool.clone())
+                    .with_schema_name("public")
+                    .map_err(|e| anyhow::anyhow!(e))?
+                    .with_table_name("tower_sessions")
+                    .map_err(|e| anyhow::anyhow!(e))?,
+            ),
+            DbPool::MySql(pool) => {
+                let schema_name = db.database_name().ok_or_else(|| {
+                    anyhow::anyhow!("mysql database URL must include a database name")
+                })?;
+
+                Self::MySql(
+                    MySqlStore::new(pool.clone())
+                        .with_schema_name(schema_name)
+                        .map_err(|e| anyhow::anyhow!(e))?
+                        .with_table_name("tower_sessions")
+                        .map_err(|e| anyhow::anyhow!(e))?,
+                )
+            }
+        })
+    }
+
+    async fn migrate(&self) -> sqlx::Result<()> {
+        match self {
+            Self::Sqlite(store) => store.migrate().await,
+            Self::Postgres(store) => store.migrate().await,
+            Self::MySql(store) => store.migrate().await,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ExpiredDeletion for SqlxSessionStore {
+    async fn delete_expired(&self) -> session_store::Result<()> {
+        match self {
+            Self::Sqlite(store) => store.delete_expired().await,
+            Self::Postgres(store) => store.delete_expired().await,
+            Self::MySql(store) => store.delete_expired().await,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl SessionStore for SqlxSessionStore {
+    async fn create(&self, record: &mut Record) -> session_store::Result<()> {
+        match self {
+            Self::Sqlite(store) => store.create(record).await,
+            Self::Postgres(store) => store.create(record).await,
+            Self::MySql(store) => store.create(record).await,
+        }
+    }
+
+    async fn save(&self, record: &Record) -> session_store::Result<()> {
+        match self {
+            Self::Sqlite(store) => store.save(record).await,
+            Self::Postgres(store) => store.save(record).await,
+            Self::MySql(store) => store.save(record).await,
+        }
+    }
+
+    async fn load(&self, session_id: &Id) -> session_store::Result<Option<Record>> {
+        match self {
+            Self::Sqlite(store) => store.load(session_id).await,
+            Self::Postgres(store) => store.load(session_id).await,
+            Self::MySql(store) => store.load(session_id).await,
+        }
+    }
+
+    async fn delete(&self, session_id: &Id) -> session_store::Result<()> {
+        match self {
+            Self::Sqlite(store) => store.delete(session_id).await,
+            Self::Postgres(store) => store.delete(session_id).await,
+            Self::MySql(store) => store.delete(session_id).await,
+        }
+    }
+}
 
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
 struct ListSessionJsonResp(Vec<StorageToken>);
@@ -210,7 +300,7 @@ impl RestfulServer {
         //
         // This uses `tower-sessions` to establish a layer that will provide the session
         // as a request extension.
-        let session_store = SqliteStore::new(self.db.inner());
+        let session_store = SqlxSessionStore::from_db(&self.db)?;
         session_store.migrate().await?;
 
         let delete_task = AbortOnDropHandle::new(tokio::task::spawn(
