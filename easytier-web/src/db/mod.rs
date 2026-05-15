@@ -2,6 +2,7 @@
 #[allow(unused_imports)]
 pub mod entity;
 
+use anyhow::{Context as _, bail};
 use easytier::{
     common::config::ConfigSource,
     launcher::NetworkConfig,
@@ -10,10 +11,15 @@ use easytier::{
 use entity::user_running_network_configs;
 use sea_orm::{
     ColumnTrait as _, DatabaseConnection, DbErr, EntityTrait, QueryFilter as _, Set,
-    SqlxSqliteConnector, TransactionTrait as _, prelude::Expr, sea_query::OnConflict,
+    SqlxMySqlConnector, SqlxPostgresConnector, SqlxSqliteConnector, TransactionTrait as _,
+    prelude::Expr, sea_query::OnConflict,
 };
 use sea_orm_migration::MigratorTrait as _;
-use sqlx::{Sqlite, SqlitePool, migrate::MigrateDatabase as _, types::chrono};
+use sqlx::{
+    MySql, MySqlPool, PgPool, Postgres, Sqlite, SqlitePool, migrate::MigrateDatabase as _,
+    types::chrono,
+};
+use url::Url;
 use uuid::Uuid;
 
 use crate::migrator;
@@ -21,48 +27,173 @@ use async_trait::async_trait;
 
 pub type UserIdInDb = i32;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DbKind {
+    Sqlite,
+    Postgres,
+    MySql,
+}
+
+#[derive(Debug, Clone)]
+pub enum DbPool {
+    Sqlite(SqlitePool),
+    Postgres(PgPool),
+    MySql(MySqlPool),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DbUrl {
+    raw: String,
+    connection_url: String,
+    kind: DbKind,
+    database_name: Option<String>,
+}
+
+impl DbUrl {
+    fn parse(db: &str) -> anyhow::Result<Self> {
+        let raw = db.trim();
+        if raw.is_empty() {
+            bail!("database path or URL cannot be empty");
+        }
+
+        let lower = raw.to_ascii_lowercase();
+        let kind = if lower.starts_with("postgres://") || lower.starts_with("postgresql://") {
+            DbKind::Postgres
+        } else if lower.starts_with("mysql://") {
+            DbKind::MySql
+        } else if lower.starts_with("sqlite://")
+            || lower.starts_with("sqlite:")
+            || raw == ":memory:"
+        {
+            DbKind::Sqlite
+        } else if lower.contains("://") {
+            bail!("unsupported database URL scheme in '{raw}'");
+        } else {
+            DbKind::Sqlite
+        };
+
+        let database_name = match kind {
+            DbKind::Postgres | DbKind::MySql => {
+                let url = Url::parse(raw).context("failed to parse database URL")?;
+                let name = url
+                    .path_segments()
+                    .and_then(|mut segments| segments.next())
+                    .filter(|name| !name.is_empty())
+                    .map(ToOwned::to_owned);
+
+                if matches!(kind, DbKind::MySql) && name.is_none() {
+                    bail!("mysql database URL must include a database name");
+                }
+
+                name
+            }
+            DbKind::Sqlite => None,
+        };
+
+        Ok(Self {
+            raw: raw.to_string(),
+            connection_url: raw.to_string(),
+            kind,
+            database_name,
+        })
+    }
+}
+
+impl DbPool {
+    fn to_orm_connection(&self) -> DatabaseConnection {
+        match self {
+            Self::Sqlite(pool) => SqlxSqliteConnector::from_sqlx_sqlite_pool(pool.clone()),
+            Self::Postgres(pool) => SqlxPostgresConnector::from_sqlx_postgres_pool(pool.clone()),
+            Self::MySql(pool) => SqlxMySqlConnector::from_sqlx_mysql_pool(pool.clone()),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Db {
-    db_path: String,
-    db: SqlitePool,
+    db_url: DbUrl,
+    db: DbPool,
     orm_db: DatabaseConnection,
 }
 
 impl Db {
     pub async fn new<T: ToString>(db_path: T) -> anyhow::Result<Self> {
-        let db = Self::prepare_db(db_path.to_string().as_str()).await?;
-        let orm_db = SqlxSqliteConnector::from_sqlx_sqlite_pool(db.clone());
+        let db_url = DbUrl::parse(db_path.to_string().as_str())?;
+        let db = Self::prepare_db(&db_url).await?;
+        let orm_db = db.to_orm_connection();
         migrator::Migrator::up(&orm_db, None).await?;
 
-        Ok(Self {
-            db_path: db_path.to_string(),
-            db,
-            orm_db,
-        })
+        Ok(Self { db_url, db, orm_db })
     }
 
     pub async fn memory_db() -> Self {
         Self::new(":memory:").await.unwrap()
     }
 
-    #[tracing::instrument(ret)]
-    async fn prepare_db(db_path: &str) -> anyhow::Result<SqlitePool> {
+    #[tracing::instrument(skip(db_url))]
+    async fn prepare_db(db_url: &DbUrl) -> anyhow::Result<DbPool> {
+        match db_url.kind {
+            DbKind::Sqlite => Self::prepare_sqlite_db(&db_url.connection_url)
+                .await
+                .map(DbPool::Sqlite),
+            DbKind::Postgres => Self::connect_postgres_db(&db_url.connection_url)
+                .await
+                .map(DbPool::Postgres),
+            DbKind::MySql => Self::connect_mysql_db(&db_url.connection_url)
+                .await
+                .map(DbPool::MySql),
+        }
+    }
+
+    async fn prepare_sqlite_db(db_path: &str) -> anyhow::Result<SqlitePool> {
         if !Sqlite::database_exists(db_path).await.unwrap_or(false) {
-            tracing::info!("Database not found, creating a new one");
+            tracing::info!("SQLite database not found, creating a new one");
             Sqlite::create_database(db_path).await?;
         }
 
-        let db = sqlx::pool::PoolOptions::new()
+        sqlx::pool::PoolOptions::<Sqlite>::new()
             .max_lifetime(None)
             .idle_timeout(None)
             .connect(db_path)
-            .await?;
+            .await
+            .context("failed to connect to SQLite database")
+    }
 
-        Ok(db)
+    async fn connect_postgres_db(db_url: &str) -> anyhow::Result<PgPool> {
+        sqlx::pool::PoolOptions::<Postgres>::new()
+            .max_lifetime(None)
+            .idle_timeout(None)
+            .connect(db_url)
+            .await
+            .context("failed to connect to PostgreSQL database")
+    }
+
+    async fn connect_mysql_db(db_url: &str) -> anyhow::Result<MySqlPool> {
+        sqlx::pool::PoolOptions::<MySql>::new()
+            .max_lifetime(None)
+            .idle_timeout(None)
+            .connect(db_url)
+            .await
+            .context("failed to connect to MySQL database")
+    }
+
+    pub fn kind(&self) -> DbKind {
+        self.db_url.kind
+    }
+
+    pub fn pool(&self) -> &DbPool {
+        &self.db
     }
 
     pub fn inner(&self) -> SqlitePool {
-        self.db.clone()
+        match &self.db {
+            DbPool::Sqlite(pool) => pool.clone(),
+            _ => panic!("inner SQLite pool is only available for SQLite databases"),
+        }
+    }
+
+    pub fn database_name(&self) -> Option<&str> {
+        self.db_url.database_name.as_deref()
     }
 
     pub fn orm_db(&self) -> &DatabaseConnection {
@@ -289,6 +420,40 @@ mod tests {
     use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter as _, Set};
 
     use crate::db::{Db, ListNetworkProps, entity::user_running_network_configs};
+
+    use super::{DbKind, DbUrl};
+
+    #[test]
+    fn test_parse_sqlite_db_paths_and_urls() {
+        for raw in ["et.db", "/tmp/easytier.db", ":memory:", "sqlite://et.db"] {
+            let parsed = DbUrl::parse(raw).unwrap();
+            assert_eq!(parsed.kind, DbKind::Sqlite);
+            assert_eq!(parsed.connection_url, raw);
+            assert_eq!(parsed.database_name, None);
+        }
+    }
+
+    #[test]
+    fn test_parse_postgres_and_mysql_urls() {
+        let postgres = DbUrl::parse("postgres://user:pass@localhost/easytier").unwrap();
+        assert_eq!(postgres.kind, DbKind::Postgres);
+        assert_eq!(postgres.database_name.as_deref(), Some("easytier"));
+
+        let postgresql = DbUrl::parse("postgresql://user:pass@localhost/easytier").unwrap();
+        assert_eq!(postgresql.kind, DbKind::Postgres);
+        assert_eq!(postgresql.database_name.as_deref(), Some("easytier"));
+
+        let mysql = DbUrl::parse("mysql://user:pass@localhost/easytier").unwrap();
+        assert_eq!(mysql.kind, DbKind::MySql);
+        assert_eq!(mysql.database_name.as_deref(), Some("easytier"));
+    }
+
+    #[test]
+    fn test_parse_rejects_unsupported_urls() {
+        assert!(DbUrl::parse("").is_err());
+        assert!(DbUrl::parse("redis://localhost/0").is_err());
+        assert!(DbUrl::parse("mysql://user:pass@localhost").is_err());
+    }
 
     #[tokio::test]
     async fn test_user_network_config_management() {

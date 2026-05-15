@@ -1,4 +1,5 @@
 use sea_orm_migration::prelude::*;
+use sea_orm_migration::sea_orm::DbBackend;
 
 pub struct Migration;
 
@@ -11,7 +12,31 @@ impl MigrationName for Migration {
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        if manager
+            .has_column("user_running_network_configs", "source")
+            .await?
+        {
+            return Ok(());
+        }
+
         let db = manager.get_connection();
+        if !matches!(db.get_database_backend(), DbBackend::Sqlite) {
+            manager
+                .alter_table(
+                    Table::alter()
+                        .table(UserRunningNetworkConfigs::Table)
+                        .add_column(
+                            ColumnDef::new(UserRunningNetworkConfigs::Source)
+                                .string()
+                                .not_null()
+                                .default("legacy"),
+                        )
+                        .to_owned(),
+                )
+                .await?;
+
+            return Ok(());
+        }
 
         db.execute_unprepared(
             r#"
@@ -69,7 +94,26 @@ impl MigrationTrait for Migration {
     }
 
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        if !manager
+            .has_column("user_running_network_configs", "source")
+            .await?
+        {
+            return Ok(());
+        }
+
         let db = manager.get_connection();
+        if !matches!(db.get_database_backend(), DbBackend::Sqlite) {
+            manager
+                .alter_table(
+                    Table::alter()
+                        .table(UserRunningNetworkConfigs::Table)
+                        .drop_column(UserRunningNetworkConfigs::Source)
+                        .to_owned(),
+                )
+                .await?;
+
+            return Ok(());
+        }
 
         db.execute_unprepared(
             r#"
@@ -122,4 +166,10 @@ impl MigrationTrait for Migration {
 
         Ok(())
     }
+}
+
+#[derive(DeriveIden)]
+enum UserRunningNetworkConfigs {
+    Table,
+    Source,
 }

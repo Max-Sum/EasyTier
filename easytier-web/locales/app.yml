@@ -2,8 +2,8 @@ _version: 2
 
 cli:
   db:
-    en: "path to the sqlite3 database file, used to save all the data"
-    zh-CN: "sqlite3 数据库文件路径, 用于保存所有数据"
+    en: "database path or URL, supports SQLite paths, sqlite://..., postgres://..., postgresql://..., and mysql://..."
+    zh-CN: "数据库路径或 URL，支持 SQLite 路径、sqlite://...、postgres://...、postgresql://... 和 mysql://..."
   console_log_level:
     en: "The log level for the console logger. Possible values: trace, debug, info, warn, error"
     zh-CN: "控制台日志级别。可能的值：trace, debug, info, warn, error"
