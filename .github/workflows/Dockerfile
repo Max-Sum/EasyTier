@@ -24,7 +24,24 @@ RUN ARTIFACT_ARCH=""; \
 
 FROM base
 
-RUN apk add --no-cache tzdata tini
+RUN apk add --no-cache tzdata tini && \
+    printf '%s\n' \
+        '#!/bin/sh' \
+        'set -e' \
+        'if [ "$#" -eq 0 ]; then' \
+        '    set -- easytier-core' \
+        'else' \
+        '    case "$1" in' \
+        '        easytier-core|easytier-cli|sh|/bin/sh|ash|/bin/ash|bash|/bin/bash|/*)' \
+        '            ;;' \
+        '        -*)' \
+        '            set -- easytier-core "$@"' \
+        '            ;;' \
+        '    esac' \
+        'fi' \
+        'exec /sbin/tini -- "$@"' \
+        > /usr/local/bin/easytier-entrypoint && \
+    chmod +x /usr/local/bin/easytier-entrypoint
 WORKDIR /app
 COPY --from=builder --chmod=755 /tmp/output/* /usr/local/bin
 
@@ -42,4 +59,5 @@ EXPOSE 11011/tcp
 # wss
 EXPOSE 11012/tcp
 
-ENTRYPOINT ["/sbin/tini", "--", "easytier-core"]
+ENTRYPOINT ["easytier-entrypoint"]
+CMD ["easytier-core"]
